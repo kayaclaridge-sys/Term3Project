@@ -3,19 +3,23 @@
 
 const byte RFID_I2C_ADDRESS = 0x28;
 const int RFID_RESET_PIN = -1;
+TwoWire &RFID_BUS = Wire1;
+const char RFID_BUS_NAME[] = "Wire1";
+const char RFID_SDA_PIN[] = "SDA1";
+const char RFID_SCL_PIN[] = "SCL1";
 
 const unsigned long SAME_CARD_REPEAT_MS = 1500;
 const unsigned long STATUS_PRINT_MS = 2000;
 
-MFRC522_I2C rfid(RFID_I2C_ADDRESS, RFID_RESET_PIN);
+MFRC522_I2C rfid(RFID_I2C_ADDRESS, RFID_RESET_PIN, &RFID_BUS);
 
 String lastUid = "";
 unsigned long lastUidPrintMs = 0;
 unsigned long lastStatusPrintMs = 0;
 
 bool isI2cDevicePresent(byte address) {
-  Wire.beginTransmission(address);
-  return Wire.endTransmission() == 0;
+  RFID_BUS.beginTransmission(address);
+  return RFID_BUS.endTransmission() == 0;
 }
 
 void printHexByte(byte value) {
@@ -61,10 +65,16 @@ void setup() {
 
   Serial.println("WS1850S RFID2 test starting...");
   Serial.println("Wiring: black=GND, red=5V, yellow=SDA, white=SCL.");
+  Serial.print("Using ");
+  Serial.print(RFID_BUS_NAME);
+  Serial.print(" I2C bus: SDA=");
+  Serial.print(RFID_SDA_PIN);
+  Serial.print(", SCL=");
+  Serial.println(RFID_SCL_PIN);
   Serial.println("I2C address: 0x28");
 
-  Wire.begin();
-  Wire.setClock(400000);
+  RFID_BUS.begin();
+  RFID_BUS.setClock(400000);
 
   if (!isI2cDevicePresent(RFID_I2C_ADDRESS)) {
     Serial.println("RFID module not found on I2C address 0x28.");
