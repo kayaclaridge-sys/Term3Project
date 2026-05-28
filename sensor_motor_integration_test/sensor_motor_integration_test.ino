@@ -45,16 +45,16 @@ const uint8_t REAR_RIGHT_MOTOR = 2;
 const int LEFT_MOTOR_SIGN = 1;
 const int RIGHT_MOTOR_SIGN = -1;
 
-const int BASE_SPEED = 350;
-const int CURVE_BASE_SPEED = 320;
-const int MAX_SPEED = 350;
-const int MAX_TURN = 320;
+const int BASE_SPEED = 250;
+const int CURVE_BASE_SPEED = 250;
+const int MAX_SPEED = 650;
+const int MAX_TURN = 650;
 const int SEARCH_SPEED = 220;
 
-const int TURN_SPEED = 400;
-const int TURN_BOOST_SPEED = 420;
-const int PRE_TURN_SPEED = 350;
-const int BRIDGE_SPEED = 350;
+const int TURN_SPEED = 600;
+const int TURN_BOOST_SPEED = 600;
+const int PRE_TURN_SPEED = 600;
+const int BRIDGE_SPEED = 600;
 
 const float KP = 0.12;
 const float KD = 0.80;
@@ -69,7 +69,8 @@ const int LED_GREEN_PIN = 35;
 
 // -------------------- Junction detection tuning --------------------
 const uint8_t SPECIAL_DETECT_FRAMES = 3;
-const unsigned long PRE_TURN_MS = 300;
+const uint8_t RIGHT_ANGLE_DETECT_FRAMES = 1;
+const unsigned long PRE_TURN_MS = 150;
 const unsigned long PIVOT_KICK_MS = 0;
 const unsigned long TURN_BOOST_MS = 500;
 const unsigned long TURN_MIN_MS = 300;
@@ -449,23 +450,23 @@ void incrementOrReset(uint8_t &counter, bool condition) {
 bool isLeftRightAngleBend(const LineSnapshot &snapshot, bool tJunctionCandidate, bool hollowCrossCandidate) {
   return !tJunctionCandidate &&
          !hollowCrossCandidate &&
-         snapshot.leftCount >= 2 &&
-         snapshot.rightCount == 0 &&
-         snapshot.midCount <= 2 &&
-         snapshot.position < 3200 &&
-         snapshot.blackCount >= 2 &&
-         snapshot.blackCount <= 5;
+         snapshot.leftCount == 3 &&
+         snapshot.rightCount <= 1 &&
+         snapshot.midCount >= 1 &&
+         snapshot.position < 4300 &&
+         snapshot.blackCount >= 5 &&
+         snapshot.blackCount < QTR_SENSOR_COUNT;
 }
 
 bool isRightRightAngleBend(const LineSnapshot &snapshot, bool tJunctionCandidate, bool hollowCrossCandidate) {
   return !tJunctionCandidate &&
          !hollowCrossCandidate &&
-         snapshot.rightCount >= 2 &&
-         snapshot.leftCount == 0 &&
-         snapshot.midCount <= 2 &&
-         snapshot.position > 4800 &&
-         snapshot.blackCount >= 2 &&
-         snapshot.blackCount <= 5;
+         snapshot.rightCount == 3 &&
+         snapshot.leftCount <= 1 &&
+         snapshot.midCount >= 1 &&
+         snapshot.position > 3700 &&
+         snapshot.blackCount >= 5 &&
+         snapshot.blackCount < QTR_SENSOR_COUNT;
 }
 
 void updateDetectionCounters(const LineSnapshot &snapshot) {
@@ -475,14 +476,14 @@ void updateDetectionCounters(const LineSnapshot &snapshot) {
     snapshot.midCount <= 1 &&
     snapshot.blackCount >= 2;
 
+  bool leftAngleCandidate = isLeftRightAngleBend(snapshot, false, hollowCrossCandidate);
+  bool rightAngleCandidate = isRightRightAngleBend(snapshot, false, hollowCrossCandidate);
+
   bool tJunctionCandidate =
     !hollowCrossCandidate &&
-    snapshot.leftWing &&
-    snapshot.rightWing &&
-    (snapshot.centerPresent || snapshot.blackCount >= 6);
-
-  bool leftAngleCandidate = isLeftRightAngleBend(snapshot, tJunctionCandidate, hollowCrossCandidate);
-  bool rightAngleCandidate = isRightRightAngleBend(snapshot, tJunctionCandidate, hollowCrossCandidate);
+    !leftAngleCandidate &&
+    !rightAngleCandidate &&
+    snapshot.blackCount == QTR_SENSOR_COUNT;
 
   incrementOrReset(hollowCrossFrames, hollowCrossCandidate);
   incrementOrReset(tJunctionFrames, tJunctionCandidate);
@@ -516,8 +517,9 @@ void stopRobot() {
   Serial.println("Robot stopped.");
 }
 
-void handleTJunction() {
-  Serial.print("T junction detected. Decision: ");
+void handleTurnDecision(const char *sourceName) {
+  Serial.print(sourceName);
+  Serial.print(" detected. Decision: ");
   Serial.println(tDecisionName(nextTJunctionDecision));
 
   if (nextTJunctionDecision == T_DECISION_LEFT) {
@@ -542,13 +544,7 @@ void followLine(const LineSnapshot &snapshot) {
       return;
     }
 
-    if (tJunctionFrames >= SPECIAL_DETECT_FRAMES) {
-      resetDetectionCounters();
-      handleTJunction();
-      return;
-    }
-
-    if (leftAngleFrames >= SPECIAL_DETECT_FRAMES) {
+    if (leftAngleFrames >= RIGHT_ANGLE_DETECT_FRAMES) {
       resetDetectionCounters();
       Serial.println("Left right-angle bend detected.");
       pendingTurn = TURN_LEFT;
@@ -556,11 +552,17 @@ void followLine(const LineSnapshot &snapshot) {
       return;
     }
 
-    if (rightAngleFrames >= SPECIAL_DETECT_FRAMES) {
+    if (rightAngleFrames >= RIGHT_ANGLE_DETECT_FRAMES) {
       resetDetectionCounters();
       Serial.println("Right right-angle bend detected.");
       pendingTurn = TURN_RIGHT;
       enterState(STATE_PRE_TURN);
+      return;
+    }
+
+    if (tJunctionFrames >= SPECIAL_DETECT_FRAMES) {
+      resetDetectionCounters();
+      handleTurnDecision("T junction");
       return;
     }
   } else if (leftAngleFrames != 0 || rightAngleFrames != 0 || tJunctionFrames != 0 || hollowCrossFrames != 0) {
@@ -800,10 +802,11 @@ void printHelp() {
   Serial.println("l = next T junction: turn left");
   Serial.println("r = next T junction: turn right");
   Serial.println("x = next T junction: stop");
+  Serial.println("Right-angle bends auto-turn: left bend -> left, right bend -> right");
   Serial.println("a = force left right-angle turn state");
   Serial.println("d = force right right-angle turn state");
   Serial.println("h/? = help");
-  Serial.print("Current T decision: ");
+  Serial.print("Current T junction decision: ");
   Serial.println(tDecisionName(nextTJunctionDecision));
   Serial.println();
 }
