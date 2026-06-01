@@ -222,6 +222,8 @@ const long RAMP_MAX_TICKS = 6500;
 const long EXIT_CLEAR_TICKS = 700;
 const unsigned long RUN_TIMEOUT_MS = 45000;
 const unsigned long EXIT_CLEAR_MAX_MS = 2500;
+const float EXIT_PITCH_DROP_DEG = 1.0;
+const unsigned long EXIT_PITCH_DROP_HOLD_MS = 1000;
 
 // Stall protection while climbing.
 const float STALL_TICKS_PER_SEC = 80.0;
@@ -236,6 +238,8 @@ float targetYawDeg = 0.0;
 unsigned long missionStartMs = 0;
 unsigned long stateStartedMs = 0;
 unsigned long stallStartedMs = 0;
+unsigned long exitPitchDropDetectedMs = 0;
+float rampPeakAbsPitch = 0.0;
 
 uint8_t rampEnterFrames = 0;
 uint8_t flatExitFrames = 0;
@@ -878,6 +882,8 @@ void enterState(RampState nextState) {
 
   if (nextState == STATE_ON_RAMP) {
     rampStartTicks = forwardTicks();
+    rampPeakAbsPitch = fabs(pitchDeg);
+    exitPitchDropDetectedMs = 0;
     rampEnterFrames = 0;
     flatExitFrames = 0;
     stallStartedMs = 0;
@@ -1095,6 +1101,8 @@ void resetRampRunVariables() {
   missionStartMs = millis();
   stateStartedMs = missionStartMs;
   stallStartedMs = 0;
+  exitPitchDropDetectedMs = 0;
+  rampPeakAbsPitch = 0.0;
   rampEnterFrames = 0;
   flatExitFrames = 0;
   climbModeEnterFrames = 0;
@@ -1161,14 +1169,24 @@ void updateRampStateMachine() {
     applyRampDrive(target);
 
     long rampTicks = abs(forwardTicks() - rampStartTicks);
-    if (!climbModeActive) {
-      finishRun();
-      return;
+    rampPeakAbsPitch = max(rampPeakAbsPitch, absPitch);
+
+    if (rampPeakAbsPitch - absPitch >= EXIT_PITCH_DROP_DEG) {
+      if (exitPitchDropDetectedMs == 0) {
+        exitPitchDropDetectedMs = now;
+        Serial.println("Ramp pitch drop detected; stopping in 1 second.");
+      } else if (now - exitPitchDropDetectedMs >= EXIT_PITCH_DROP_HOLD_MS) {
+        finishRun();
+        return;
+      }
+    } else {
+      exitPitchDropDetectedMs = 0;
     }
 
     if (rampTicks > RAMP_MAX_TICKS) {
       Serial.println("Ramp max ticks reached; stopping.");
       finishRun();
+      return;
     }
   } else if (rampState == STATE_EXIT_CLEAR) {
     applyRampDrive(exitTargetTicksPerSec);

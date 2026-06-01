@@ -45,12 +45,9 @@ const int START_BOOST_COMMAND = 320;
 const int CREEP_COMMAND = 105;
 const int TOUCH_COMMAND = 62;
 const int NO_DISTANCE_COMMAND = 130;
-const int CONTACT_HOLD_COMMAND = 45;
 
 const unsigned long START_BOOST_MS = 650;
-const unsigned long CONTACT_HOLD_MS = 450;
 const unsigned long CONTACT_DEBOUNCE_MS = 35;
-const unsigned long CONTACT_LOST_RETURN_MS = 140;
 const unsigned long START_CONTACT_IGNORE_MS = 500;
 const unsigned long RUN_TIMEOUT_MS = 60000;
 
@@ -160,7 +157,6 @@ enum ReviveState {
   STATE_APPROACH,
   STATE_DECEL,
   STATE_CREEP,
-  STATE_CONTACT_HOLD,
   STATE_DONE,
   STATE_FAULT
 };
@@ -172,7 +168,6 @@ long runStartRightTicks = 0;
 float targetYawDeg = 0.0;
 unsigned long missionStartMs = 0;
 unsigned long stateStartedMs = 0;
-unsigned long contactLostSinceMs = 0;
 unsigned long lastTelemetryMs = 0;
 
 int currentLeftCommand = 0;
@@ -698,8 +693,6 @@ const char *stateName(ReviveState state) {
       return "DECEL";
     case STATE_CREEP:
       return "CREEP";
-    case STATE_CONTACT_HOLD:
-      return "CONTACT_HOLD";
     case STATE_DONE:
       return "DONE";
     case STATE_FAULT:
@@ -728,8 +721,7 @@ void updateReviveContact() {
 
   bool running = reviveState == STATE_APPROACH ||
                  reviveState == STATE_DECEL ||
-                 reviveState == STATE_CREEP ||
-                 reviveState == STATE_CONTACT_HOLD;
+                 reviveState == STATE_CREEP;
 
   if (running && !d32ReleasedAfterStart && !startReviveButtonDown) {
     d32ReleasedAfterStart = true;
@@ -841,7 +833,6 @@ void startReviveRun() {
   runStartRightTicks = rightTicks();
   targetYawDeg = yawDeg;
   missionStartMs = millis();
-  contactLostSinceMs = 0;
   d32ReleasedAfterStart = !startReviveButtonDown;
   reviveRawContact = false;
   reviveContact = false;
@@ -867,7 +858,7 @@ void stopReviveRun() {
 void finishReviveRun() {
   stopDrive();
   enterState(STATE_DONE);
-  Serial.println("Task 8 complete: revive contact held, robot stopped.");
+  Serial.println("Task 8 complete: revive contact detected, robot stopped.");
 }
 
 void updateReviveStateMachine() {
@@ -892,29 +883,8 @@ void updateReviveStateMachine() {
     return;
   }
 
-  if (reviveState != STATE_CONTACT_HOLD && reviveContact) {
-    contactLostSinceMs = 0;
-    enterState(STATE_CONTACT_HOLD);
-  }
-
-  if (reviveState == STATE_CONTACT_HOLD) {
-    if (reviveContact) {
-      contactLostSinceMs = 0;
-    } else if (contactLostSinceMs == 0) {
-      contactLostSinceMs = now;
-    } else if (now - contactLostSinceMs > CONTACT_LOST_RETURN_MS &&
-               now - stateStartedMs < CONTACT_HOLD_MS) {
-      Serial.println("Contact lost during hold; returning to creep.");
-      enterState(STATE_CREEP);
-      return;
-    }
-
-    applyStraightDrive(CONTACT_HOLD_COMMAND);
-
-    if (now - stateStartedMs >= CONTACT_HOLD_MS) {
-      finishReviveRun();
-    }
-
+  if (reviveContact) {
+    finishReviveRun();
     return;
   }
 
@@ -1053,8 +1023,7 @@ void maybePrintLiveTelemetry() {
 
   bool active = reviveState == STATE_APPROACH ||
                 reviveState == STATE_DECEL ||
-                reviveState == STATE_CREEP ||
-                reviveState == STATE_CONTACT_HOLD;
+                reviveState == STATE_CREEP;
 
   if (!active) {
     return;
