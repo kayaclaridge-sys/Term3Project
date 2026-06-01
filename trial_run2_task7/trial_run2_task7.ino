@@ -3,8 +3,8 @@
 #include <MFRC522_I2C.h>
 
 // =====================================================
-// Trial Run 2 - Task 3 RFID navigation
-// QTR line tracking + RFID map routing + Motoron drive, no encoders.
+// Trial Run 2 - Task 7 obstacle avoidance
+// QTR line tracking + RFID node actions + front ultrasonic trigger, no encoders.
 // =====================================================
 
 // -------------------- QTR 9-channel RC line sensor --------------------
@@ -67,6 +67,21 @@ const int START_BUTTON_PIN = 32;
 const int STOP_BUTTON_PIN = 33;
 const int LED_RED_PIN = 34;
 const int LED_GREEN_PIN = 35;
+
+// -------------------- Front HC-SR04 obstacle sensor --------------------
+const int TRIG_FRONT_PIN = 36;
+const int ECHO_FRONT_PIN = 37;
+
+const float SOUND_SPEED_CM_PER_US = 0.0343;
+const float FRONT_MIN_VALID_CM = 3.0;
+const float FRONT_MAX_VALID_CM = 180.0;
+const float FRONT_TRIGGER_DROP_CM = 5.0;
+const unsigned long FRONT_DISTANCE_POLL_MS = 10;
+
+float frontDistanceCm = -1.0;
+float initialFrontDistanceCm = -1.0;
+unsigned long lastFrontDistancePollMs = 0;
+uint8_t initialFrontValidReadCount = 0;
 
 // -------------------- RFID navigation map --------------------
 const byte RFID_I2C_ADDRESS = 0x28;
@@ -137,11 +152,6 @@ enum TurnDirection {
   TURN_RIGHT
 };
 
-enum NavigationMode {
-  NAV_MODE_TASK3_FIXED,
-  NAV_MODE_AUTO_ROUTE
-};
-
 enum Heading {
   HEADING_NORTH,
   HEADING_EAST,
@@ -158,13 +168,16 @@ enum RouteAction {
   ROUTE_ACTION_UNSUPPORTED
 };
 
-const RouteAction TASK3_FIXED_ACTIONS[] = {
-  ROUTE_ACTION_STRAIGHT,
+const RouteAction TASK7_AVOIDANCE_ACTIONS[] = {
   ROUTE_ACTION_RIGHT,
   ROUTE_ACTION_LEFT,
+  ROUTE_ACTION_STRAIGHT,
+  ROUTE_ACTION_LEFT,
+  ROUTE_ACTION_RIGHT,
+  ROUTE_ACTION_STRAIGHT,
   ROUTE_ACTION_STRAIGHT
 };
-const uint8_t TASK3_FIXED_ACTION_COUNT = sizeof(TASK3_FIXED_ACTIONS) / sizeof(TASK3_FIXED_ACTIONS[0]);
+const uint8_t TASK7_AVOIDANCE_ACTION_COUNT = sizeof(TASK7_AVOIDANCE_ACTIONS) / sizeof(TASK7_AVOIDANCE_ACTIONS[0]);
 
 struct GridPoint {
   int8_t row;
@@ -173,21 +186,17 @@ struct GridPoint {
 
 RobotState robotState = STATE_IDLE;
 TurnDirection pendingTurn = TURN_NONE;
-NavigationMode selectedNavMode = NAV_MODE_TASK3_FIXED;
 Heading currentHeading = HEADING_EAST;
 Heading configuredStartHeading = HEADING_EAST;
 RouteAction pendingPausedAction = ROUTE_ACTION_IGNORE;
-bool lineOnlyMode = false;
 bool rfidReady = false;
 bool routeActive = false;
 
 GridPoint activeRoute[MAX_ROUTE_POINTS];
 uint8_t activeRouteLength = 0;
 uint8_t activeRouteIndex = 0;
-uint8_t fixedActionIndex = 0;
+uint8_t task7AvoidanceActionIndex = 0;
 
-String autoStartUid = "";
-String autoGoalUid = "";
 String latestRfidUid = "";
 String lastActionUid = "";
 String serialLine = "";
@@ -198,6 +207,8 @@ unsigned long lastMonitorPrintMs = 0;
 unsigned long lastRfidPollMs = 0;
 bool lineLostLatched = false;
 bool turnReleaseArmed = false;
+bool task7AvoidanceTriggered = false;
+bool task7AvoidanceFinished = false;
 
 uint8_t leftAngleFrames = 0;
 uint8_t rightAngleFrames = 0;
@@ -445,6 +456,115 @@ void stopDrive() {
 }
 
 // =====================================================
+// Front ultrasonic obstacle detection
+// =====================================================
+
+unsigned long timeoutFromDistance(float cm) {
+  return (unsigned long)(cm * 2.0 / SOUND_SPEED_CM_PER_US) + 800;
+}
+
+float readFrontDistanceCm() {
+  digitalWrite(TRIG_FRONT_PIN, LOW);
+  delayMicroseconds(3);
+  digitalWrite(TRIG_FRONT_PIN, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(TRIG_FRONT_PIN, LOW);
+
+  unsigned long timeoutUs = timeoutFromDistance(FRONT_MAX_VALID_CM);
+  unsigned long duration = pulseIn(ECHO_FRONT_PIN, HIGH, timeoutUs);
+
+  if (duration == 0) {
+    return -1.0;
+  }
+
+  float distance = duration * SOUND_SPEED_CM_PER_US / 2.0;
+
+  if (distance < FRONT_MIN_VALID_CM || distance > FRONT_MAX_VALID_CM) {
+    return -1.0;
+  }
+
+  return distance;
+}
+
+void setupFrontUltrasonic() {
+  pinMode(TRIG_FRONT_PIN, OUTPUT);
+  pinMode(ECHO_FRONT_PIN, INPUT);
+  digitalWrite(TRIG_FRONT_PIN, LOW);
+}
+
+void resetFrontObstacleDetector() {
+  frontDistanceCm = -1.0;
+  initialFrontDistanceCm = -1.0;
+  lastFrontDistancePollMs = 0;
+  initialFrontValidReadCount = 0;
+}
+
+void resetTask7Avoidance() {
+  task7AvoidanceActionIndex = 0;
+  task7AvoidanceTriggered = false;
+  task7AvoidanceFinished = false;
+  resetFrontObstacleDetector();
+}
+
+void armTask7Avoidance() {
+  if (task7AvoidanceTriggered || task7AvoidanceFinished) {
+    return;
+  }
+
+  task7AvoidanceTriggered = true;
+  task7AvoidanceActionIndex = 0;
+  lastActionUid = "";
+
+  Serial.print("Task 7 obstacle trigger: front ultrasonic distance dropped ");
+  Serial.print(FRONT_TRIGGER_DROP_CM, 1);
+  Serial.println("cm from the initial reading.");
+  Serial.println("ENTERING TASK 7 AVOIDANCE MODE.");
+  Serial.println("Task 7 avoidance sequence armed: right, left, straight, left, right, straight, straight.");
+}
+
+void updateFrontObstacleDetector() {
+  if (!routeActive || robotState != STATE_FOLLOW_LINE) {
+    return;
+  }
+
+  if (task7AvoidanceTriggered || task7AvoidanceFinished) {
+    return;
+  }
+
+  unsigned long now = millis();
+  if (now - lastFrontDistancePollMs < FRONT_DISTANCE_POLL_MS) {
+    return;
+  }
+
+  lastFrontDistancePollMs = now;
+  frontDistanceCm = readFrontDistanceCm();
+
+  if (frontDistanceCm < 0.0) {
+    return;
+  }
+
+  if (initialFrontDistanceCm < 0.0) {
+    if (initialFrontValidReadCount < 255) {
+      initialFrontValidReadCount++;
+    }
+
+    if (initialFrontValidReadCount < 2) {
+      return;
+    }
+
+    initialFrontDistanceCm = frontDistanceCm;
+    Serial.print("Task 7 initial front distance: ");
+    Serial.print(initialFrontDistanceCm, 1);
+    Serial.println("cm");
+    return;
+  }
+
+  if (initialFrontDistanceCm - frontDistanceCm >= FRONT_TRIGGER_DROP_CM) {
+    armTask7Avoidance();
+  }
+}
+
+// =====================================================
 // Detection and state machine
 // =====================================================
 
@@ -501,10 +621,6 @@ void incrementOrReset(uint8_t &counter, bool condition) {
   } else {
     counter = 0;
   }
-}
-
-const char *navigationModeName(NavigationMode mode) {
-  return mode == NAV_MODE_TASK3_FIXED ? "TASK3_FIXED" : "AUTO_ROUTE";
 }
 
 const char *headingName(Heading heading) {
@@ -711,24 +827,6 @@ bool buildRouteFromUids(const char *const *uids, uint8_t uidCount) {
   return buildRouteFromPoints(waypoints, uidCount);
 }
 
-bool buildAutoRoute() {
-  GridPoint waypoints[2];
-
-  if (!findUidInMap(autoStartUid, waypoints[0])) {
-    Serial.print("Auto start UID not found: ");
-    Serial.println(autoStartUid);
-    return false;
-  }
-
-  if (!findUidInMap(autoGoalUid, waypoints[1])) {
-    Serial.print("Auto goal UID not found: ");
-    Serial.println(autoGoalUid);
-    return false;
-  }
-
-  return buildRouteFromPoints(waypoints, 2);
-}
-
 Heading headingBetween(GridPoint from, GridPoint to) {
   if (to.row < from.row) {
     return HEADING_NORTH;
@@ -787,6 +885,7 @@ void resetQTRSensor() {
   lastError = 0;
   lineLostLatched = false;
   resetDetectionCounters();
+  resetFrontObstacleDetector();
 
   Serial.println("QTR sensor reset. Starting calibration.");
   runQTRCalibration();
@@ -794,60 +893,31 @@ void resetQTRSensor() {
   Serial.println("QTR reset and calibration done.");
 }
 
-void printFixedActions() {
-  Serial.println("Fixed Task 3 action sequence on any new RFID:");
+void printTask7Actions() {
+  Serial.println("Task 7 action sequence after ultrasonic trigger:");
 
-  for (uint8_t i = 0; i < TASK3_FIXED_ACTION_COUNT; i++) {
+  for (uint8_t i = 0; i < TASK7_AVOIDANCE_ACTION_COUNT; i++) {
     Serial.print(i + 1);
     Serial.print(": ");
-    Serial.println(routeActionName(TASK3_FIXED_ACTIONS[i]));
+    Serial.println(routeActionName(TASK7_AVOIDANCE_ACTIONS[i]));
   }
 
-  Serial.println("Each RFID pauses briefly, then consumes one action. The next RFID after the sequence stops.");
+  Serial.println("Before the trigger, each new RFID pauses then continues straight.");
+  Serial.println("After the trigger, each new RFID consumes one avoidance action.");
+  Serial.println("The next RFID after the full sequence stops the robot.");
 }
 
 bool prepareSelectedRoute() {
-  bool routeBuilt = false;
-
-  if (selectedNavMode == NAV_MODE_TASK3_FIXED) {
-    activeRouteLength = 0;
-    activeRouteIndex = 0;
-    fixedActionIndex = 0;
-    routeBuilt = true;
-  } else {
-    if (autoStartUid.length() == 0 && latestRfidUid.length() > 0) {
-      autoStartUid = latestRfidUid;
-      Serial.print("Auto start set from latest RFID: ");
-      Serial.println(autoStartUid);
-    }
-
-    if (autoStartUid.length() == 0 || autoGoalUid.length() == 0) {
-      Serial.println("Auto route needs start and goal UIDs. Use: start <uid> and goal <uid>");
-      return false;
-    }
-
-    routeBuilt = buildAutoRoute();
-  }
-
-  if (!routeBuilt) {
-    Serial.println("Route build failed.");
-    routeActive = false;
-    return false;
-  }
-
+  activeRouteLength = 0;
   activeRouteIndex = 0;
+  resetTask7Avoidance();
   currentHeading = configuredStartHeading;
   routeActive = true;
 
-  Serial.print("Navigation mode: ");
-  Serial.println(navigationModeName(selectedNavMode));
+  Serial.println("Navigation mode: automatic Task 7 obstacle avoidance.");
   Serial.print("Start heading: ");
   Serial.println(headingName(currentHeading));
-  if (selectedNavMode == NAV_MODE_TASK3_FIXED) {
-    printFixedActions();
-  } else {
-    printActiveRoute();
-  }
+  printTask7Actions();
   return true;
 }
 
@@ -889,86 +959,48 @@ void executeRouteAction(RouteAction action) {
   enterState(STATE_RFID_PAUSE);
 }
 
-void handleFixedTask3Rfid(const String &uid) {
-  if (fixedActionIndex < TASK3_FIXED_ACTION_COUNT) {
-    RouteAction action = TASK3_FIXED_ACTIONS[fixedActionIndex];
+void handleTask7Rfid(const String &uid) {
+  if (!task7AvoidanceTriggered) {
+    Serial.print("Task 7 waiting for obstacle trigger. Pausing at RFID: ");
+    Serial.println(uid);
+    executeRouteAction(ROUTE_ACTION_STRAIGHT);
+    return;
+  }
 
-    Serial.print("Fixed action ");
-    Serial.print(fixedActionIndex + 1);
+  if (task7AvoidanceActionIndex < TASK7_AVOIDANCE_ACTION_COUNT) {
+    RouteAction action = TASK7_AVOIDANCE_ACTIONS[task7AvoidanceActionIndex];
+
+    Serial.print("Task 7 avoidance action ");
+    Serial.print(task7AvoidanceActionIndex + 1);
     Serial.print("/");
-    Serial.print(TASK3_FIXED_ACTION_COUNT);
+    Serial.print(TASK7_AVOIDANCE_ACTION_COUNT);
     Serial.print(" at ");
     Serial.print(uid);
     Serial.print(": ");
     Serial.println(routeActionName(action));
 
-    fixedActionIndex++;
+    task7AvoidanceActionIndex++;
     executeRouteAction(action);
 
-    if (fixedActionIndex >= TASK3_FIXED_ACTION_COUNT) {
-      Serial.println("Fixed action sequence complete. Next new RFID will stop.");
+    if (task7AvoidanceActionIndex >= TASK7_AVOIDANCE_ACTION_COUNT) {
+      task7AvoidanceFinished = true;
+      Serial.println("Task 7 avoidance sequence complete. Next new RFID will stop.");
     }
 
     return;
   }
 
   routeActive = false;
-  Serial.println("Fixed Task 3 sequence complete. Stopping at this RFID.");
+  Serial.println("Task 7 complete. Stopping at this RFID.");
   executeRouteAction(ROUTE_ACTION_STOP);
 }
 
 void handleRouteRfid(const String &uid) {
-  if (!routeActive || robotState != STATE_FOLLOW_LINE || lineOnlyMode) {
+  if (!routeActive || robotState != STATE_FOLLOW_LINE) {
     return;
   }
 
-  if (selectedNavMode == NAV_MODE_TASK3_FIXED) {
-    handleFixedTask3Rfid(uid);
-    return;
-  }
-
-  GridPoint point;
-  if (!findUidInMap(uid, point)) {
-    Serial.print("RFID not found in map: ");
-    Serial.println(uid);
-    return;
-  }
-
-  int routeMatch = -1;
-  for (uint8_t i = activeRouteIndex; i < activeRouteLength; i++) {
-    if (samePoint(point, activeRoute[i])) {
-      routeMatch = i;
-      break;
-    }
-  }
-
-  if (routeMatch < 0) {
-    Serial.print("RFID is not on active route: ");
-    Serial.println(uid);
-    return;
-  }
-
-  activeRouteIndex = routeMatch;
-
-  Serial.print("RFID route point ");
-  Serial.print(activeRouteIndex);
-  Serial.print("/");
-  Serial.print(activeRouteLength - 1);
-  Serial.print(": ");
-  Serial.println(uid);
-
-  if (activeRouteIndex >= activeRouteLength - 1) {
-    routeActive = false;
-    executeRouteAction(ROUTE_ACTION_STOP);
-    return;
-  }
-
-  Heading nextHeading = headingBetween(activeRoute[activeRouteIndex], activeRoute[activeRouteIndex + 1]);
-  RouteAction action = actionFromHeading(currentHeading, nextHeading);
-  currentHeading = nextHeading;
-  activeRouteIndex++;
-
-  executeRouteAction(action);
+  handleTask7Rfid(uid);
 }
 
 bool isI2cDevicePresent(byte address) {
@@ -1011,7 +1043,7 @@ void pollRFID() {
   Serial.print("RFID detected: ");
   Serial.println(uid);
 
-  bool navigationCanUseUid = routeActive && robotState == STATE_FOLLOW_LINE && !lineOnlyMode;
+  bool navigationCanUseUid = routeActive && robotState == STATE_FOLLOW_LINE;
   bool repeatedAction = uid == lastActionUid;
   if (navigationCanUseUid && !repeatedAction) {
     lastActionUid = uid;
@@ -1023,7 +1055,6 @@ void pollRFID() {
 }
 
 void startRobot() {
-  lineOnlyMode = false;
   if (!prepareSelectedRoute()) {
     stopRobot();
     return;
@@ -1035,18 +1066,7 @@ void startRobot() {
   lastActionUid = "";
   lastLineSeenMs = millis();
   enterState(STATE_FOLLOW_LINE);
-  Serial.println("Robot started in RFID navigation mode.");
-}
-
-void startLineOnlyRobot() {
-  lineOnlyMode = true;
-  routeActive = false;
-  resetDetectionCounters();
-  lastError = 0;
-  lineLostLatched = false;
-  lastLineSeenMs = millis();
-  enterState(STATE_FOLLOW_LINE);
-  Serial.println("Robot started in line-only mode.");
+  Serial.println("Robot started in automatic Task 7 mode.");
 }
 
 void stopRobot() {
@@ -1242,11 +1262,7 @@ void printSnapshot(const LineSnapshot &snapshot) {
   Serial.print("state=");
   Serial.print(stateName(robotState));
   Serial.print(" mode=");
-  if (lineOnlyMode) {
-    Serial.print("LINE_ONLY");
-  } else {
-    Serial.print(navigationModeName(selectedNavMode));
-  }
+  Serial.print("TASK7_AUTO");
   Serial.print(" pattern=");
 
   for (uint8_t i = 0; i < QTR_SENSOR_COUNT; i++) {
@@ -1289,10 +1305,30 @@ void printSnapshot(const LineSnapshot &snapshot) {
   Serial.print(activeRouteIndex);
   Serial.print("/");
   Serial.print(activeRouteLength);
-  Serial.print(" fixed=");
-  Serial.print(fixedActionIndex);
+  Serial.print(" front=");
+  if (frontDistanceCm > 0.0) {
+    Serial.print(frontDistanceCm, 1);
+  } else {
+    Serial.print("invalid");
+  }
+  Serial.print("cm initial=");
+  if (initialFrontDistanceCm > 0.0) {
+    Serial.print(initialFrontDistanceCm, 1);
+  } else {
+    Serial.print("unset");
+  }
+  Serial.print("cm drop=");
+  if (initialFrontDistanceCm > 0.0 && frontDistanceCm > 0.0) {
+    Serial.print(initialFrontDistanceCm - frontDistanceCm, 1);
+  } else {
+    Serial.print("n/a");
+  }
+  Serial.print(" task7=");
+  Serial.print(task7AvoidanceTriggered ? "TRIGGERED" : "WAITING");
+  Serial.print(" action=");
+  Serial.print(task7AvoidanceActionIndex);
   Serial.print("/");
-  Serial.println(TASK3_FIXED_ACTION_COUNT);
+  Serial.println(TASK7_AVOIDANCE_ACTION_COUNT);
 }
 
 void printCurrentSnapshot() {
@@ -1302,61 +1338,22 @@ void printCurrentSnapshot() {
 
 void printHelp() {
   Serial.println();
-  Serial.println("--- Trial Run 2 Task 3 RFID navigation ---");
-  Serial.println("1 = select fixed Task 3 sequence: straight, right, left, straight");
-  Serial.println("2 = select user start/goal auto route");
-  Serial.println("start <uid> = set auto-route start RFID");
-  Serial.println("goal <uid> = set auto-route goal RFID");
-  Serial.println("heading north/east/south/west = set starting heading");
-  Serial.println("g = start selected navigation mode");
-  Serial.println("o = start line-only following, RFID actions disabled");
+  Serial.println("--- Trial Run 2 Task 7 obstacle avoidance ---");
+  Serial.println("Automatic mode only: QTR line follow + RFID node pauses + ultrasonic obstacle trigger.");
+  Serial.println("Task 7 trigger = front ultrasonic distance drops 5cm from the initial reading");
+  Serial.println("Task 7 actions = right, left, straight, left, right, straight, straight");
+  Serial.println("g = start automatic Task 7");
   Serial.println("s = stop");
   Serial.println("c = reset and recalibrate QTR");
   Serial.println("p = print one sensor snapshot");
   Serial.println("m = toggle live sensor monitor");
-  Serial.println("route = print active route or fixed action sequence");
+  Serial.println("route = print Task 7 action sequence");
   Serial.println("rfid = print latest RFID");
-  Serial.println("a/d = debug force left/right turn state");
   Serial.println("h/?/help = help");
   Serial.println("qtr / qtr reset / reset qtr = reset and recalibrate QTR");
-  Serial.print("Current mode: ");
-  Serial.println(navigationModeName(selectedNavMode));
   Serial.print("Start heading: ");
   Serial.println(headingName(configuredStartHeading));
-  Serial.print("Auto start: ");
-  if (autoStartUid.length() > 0) {
-    Serial.println(autoStartUid);
-  } else {
-    Serial.println("(not set)");
-  }
-  Serial.print("Auto goal: ");
-  if (autoGoalUid.length() > 0) {
-    Serial.println(autoGoalUid);
-  } else {
-    Serial.println("(not set)");
-  }
   Serial.println();
-}
-
-bool setHeadingFromText(String text) {
-  text.trim();
-  text.toUpperCase();
-
-  if (text == "N" || text == "NORTH") {
-    configuredStartHeading = HEADING_NORTH;
-  } else if (text == "E" || text == "EAST") {
-    configuredStartHeading = HEADING_EAST;
-  } else if (text == "S" || text == "SOUTH") {
-    configuredStartHeading = HEADING_SOUTH;
-  } else if (text == "W" || text == "WEST") {
-    configuredStartHeading = HEADING_WEST;
-  } else {
-    return false;
-  }
-
-  Serial.print("Start heading set to ");
-  Serial.println(headingName(configuredStartHeading));
-  return true;
 }
 
 void processSerialCommand(String command) {
@@ -1372,16 +1369,8 @@ void processSerialCommand(String command) {
   if (command.length() == 1) {
     char key = command.charAt(0);
 
-    if (key == '1') {
-      selectedNavMode = NAV_MODE_TASK3_FIXED;
-      Serial.println("Selected mode: fixed Task 3 route.");
-    } else if (key == '2') {
-      selectedNavMode = NAV_MODE_AUTO_ROUTE;
-      Serial.println("Selected mode: user start/goal auto route.");
-    } else if (key == 'g' || key == 'G') {
+    if (key == 'g' || key == 'G') {
       startRobot();
-    } else if (key == 'o' || key == 'O') {
-      startLineOnlyRobot();
     } else if (key == 's' || key == 'S') {
       stopRobot();
     } else if (key == 'c' || key == 'C') {
@@ -1393,14 +1382,6 @@ void processSerialCommand(String command) {
       monitorSensors = !monitorSensors;
       Serial.print("Live monitor: ");
       Serial.println(monitorSensors ? "ON" : "OFF");
-    } else if (key == 'a' || key == 'A') {
-      lineOnlyMode = false;
-      pendingTurn = TURN_LEFT;
-      enterState(STATE_PRE_TURN);
-    } else if (key == 'd' || key == 'D') {
-      lineOnlyMode = false;
-      pendingTurn = TURN_RIGHT;
-      enterState(STATE_PRE_TURN);
     } else if (key == 'h' || key == 'H' || key == '?') {
       printHelp();
     } else {
@@ -1412,30 +1393,8 @@ void processSerialCommand(String command) {
     return;
   }
 
-  if (lower.startsWith("start ")) {
-    autoStartUid = normalizeUid(command.substring(6));
-    Serial.print("Auto start UID set to ");
-    Serial.println(autoStartUid);
-  } else if (lower.startsWith("goal ")) {
-    autoGoalUid = normalizeUid(command.substring(5));
-    Serial.print("Auto goal UID set to ");
-    Serial.println(autoGoalUid);
-  } else if (lower.startsWith("heading ")) {
-    if (!setHeadingFromText(command.substring(8))) {
-      Serial.println("Unknown heading. Use north/east/south/west.");
-    }
-  } else if (lower == "mode fixed") {
-    selectedNavMode = NAV_MODE_TASK3_FIXED;
-    Serial.println("Selected mode: fixed Task 3 route.");
-  } else if (lower == "mode auto") {
-    selectedNavMode = NAV_MODE_AUTO_ROUTE;
-    Serial.println("Selected mode: user start/goal auto route.");
-  } else if (lower == "route") {
-    if (selectedNavMode == NAV_MODE_TASK3_FIXED) {
-      printFixedActions();
-    } else {
-      printActiveRoute();
-    }
+  if (lower == "route") {
+    printTask7Actions();
   } else if (lower == "rfid") {
     Serial.print("Latest RFID: ");
     if (latestRfidUid.length() > 0) {
@@ -1483,7 +1442,7 @@ void setup() {
   while (!Serial && millis() - startWait < 3000) {
   }
 
-  Serial.println("Trial Run 2 Task 3 RFID navigation starting...");
+  Serial.println("Trial Run 2 Task 7 obstacle avoidance starting...");
   Serial.println("Encoders are not used in this test.");
 
   pinMode(START_BUTTON_PIN, INPUT_PULLUP);
@@ -1493,6 +1452,7 @@ void setup() {
 
   pinMode(QTR_EMITTER_PIN, OUTPUT);
   digitalWrite(QTR_EMITTER_PIN, HIGH);
+  setupFrontUltrasonic();
 
   Serial.println("Initializing Motorons on Wire1...");
   Wire1.begin();
@@ -1524,12 +1484,13 @@ void setup() {
   lastLineSeenMs = millis();
   updateStatusLED();
   printHelp();
-  Serial.println("Choose 1 or 2, set heading/start/goal if needed, then send g or press D32.");
+  Serial.println("Send g or press D32 to start automatic Task 7.");
 }
 
 void loop() {
   handleSerialCommands();
   handleButtons();
+  updateFrontObstacleDetector();
   pollRFID();
   updateStateMachine();
   updateStatusLED();

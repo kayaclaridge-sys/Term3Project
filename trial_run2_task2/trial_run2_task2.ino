@@ -1,5 +1,6 @@
 #include <Wire.h>
 #include <Motoron.h>
+#include <MFRC522_I2C.h>
 
 // =====================================================
 // Sensor + motor integration test
@@ -29,7 +30,7 @@ uint16_t lastPosition = CENTER_POSITION;
 unsigned long lastLineSeenMs = 0;
 
 const long LINE_PRESENT_MIN = 250;
-const int BLACK_SENSOR_THRESHOLD = 550;
+const int BLACK_SENSOR_THRESHOLD = 600;
 const unsigned long LOST_LINE_STOP_MS = 650;
 
 // -------------------- Motoron motor controllers --------------------
@@ -52,7 +53,7 @@ const int MAX_TURN = 650;
 const int SEARCH_SPEED = 220;
 
 const int TURN_SPEED = 600;
-const int TURN_BOOST_SPEED = 600;
+const int TURN_BOOST_SPEED = 650;
 const int PRE_TURN_SPEED = 600;
 const int BRIDGE_SPEED = 600;
 
@@ -67,10 +68,19 @@ const int STOP_BUTTON_PIN = 33;
 const int LED_RED_PIN = 34;
 const int LED_GREEN_PIN = 35;
 
+// -------------------- RFID pause marker --------------------
+const byte RFID_I2C_ADDRESS = 0x28;
+const int RFID_RESET_PIN = -1;
+const unsigned long RFID_POLL_MS = 80;
+const unsigned long RFID_PAUSE_MS = 250;
+const unsigned long RFID_REPEAT_PAUSE_GUARD_MS = 1500;
+
+MFRC522_I2C rfid(RFID_I2C_ADDRESS, RFID_RESET_PIN, &Wire1);
+
 // -------------------- Junction detection tuning --------------------
 const uint8_t SPECIAL_DETECT_FRAMES = 3;
 const uint8_t RIGHT_ANGLE_DETECT_FRAMES = 1;
-const unsigned long PRE_TURN_MS = 150;
+const unsigned long PRE_TURN_MS = 110;
 const unsigned long PIVOT_KICK_MS = 0;
 const unsigned long TURN_BOOST_MS = 500;
 const unsigned long TURN_MIN_MS = 300;
@@ -100,6 +110,7 @@ struct LineSnapshot {
 enum RobotState {
   STATE_IDLE,
   STATE_FOLLOW_LINE,
+  STATE_RFID_PAUSE,
   STATE_PRE_TURN,
   STATE_TURN_LEFT,
   STATE_TURN_RIGHT,
@@ -125,12 +136,18 @@ TJunctionDecision nextTJunctionDecision = T_DECISION_STOP;
 bool lineOnlyMode = false;
 bool task2Mode = false;
 bool task2FirstTJunctionHandled = false;
+bool rfidReady = false;
 
 bool monitorSensors = false;
 unsigned long stateStartedMs = 0;
 unsigned long lastMonitorPrintMs = 0;
+unsigned long lastRfidPollMs = 0;
+unsigned long lastRfidPauseMs = 0;
 bool lineLostLatched = false;
 bool turnReleaseArmed = false;
+
+String latestRfidUid = "";
+String lastPausedRfidUid = "";
 
 uint8_t leftAngleFrames = 0;
 uint8_t rightAngleFrames = 0;
@@ -141,6 +158,7 @@ void stopDrive();
 void printHelp();
 void printSnapshot(const LineSnapshot &snapshot);
 void enterState(RobotState newState);
+void pollRFID();
 
 // =====================================================
 // QTR reading and calibration
@@ -388,6 +406,8 @@ const char *stateName(RobotState state) {
       return "IDLE";
     case STATE_FOLLOW_LINE:
       return "FOLLOW_LINE";
+    case STATE_RFID_PAUSE:
+      return "RFID_PAUSE";
     case STATE_PRE_TURN:
       return "PRE_TURN";
     case STATE_TURN_LEFT:
@@ -449,6 +469,79 @@ void incrementOrReset(uint8_t &counter, bool condition) {
   }
 }
 
+bool isI2cDevicePresent(byte address) {
+  Wire1.beginTransmission(address);
+  return Wire1.endTransmission() == 0;
+}
+
+String normalizeUid(String uid) {
+  uid.trim();
+  uid.toUpperCase();
+  uid.replace(":", "");
+  uid.replace("-", "");
+  uid.replace(" ", "");
+  return uid;
+}
+
+String readRfidUid() {
+  String uid = "";
+
+  for (byte i = 0; i < rfid.uid.size; i++) {
+    if (rfid.uid.uidByte[i] < 0x10) {
+      uid += "0";
+    }
+
+    uid += String(rfid.uid.uidByte[i], HEX);
+  }
+
+  return normalizeUid(uid);
+}
+
+void startRfidPause(const String &uid) {
+  stopDrive();
+  resetDetectionCounters();
+
+  Serial.print("RFID pause: ");
+  Serial.println(uid);
+
+  enterState(STATE_RFID_PAUSE);
+}
+
+void pollRFID() {
+  if (!rfidReady || millis() - lastRfidPollMs < RFID_POLL_MS) {
+    return;
+  }
+
+  lastRfidPollMs = millis();
+
+  if (!rfid.PICC_IsNewCardPresent()) {
+    return;
+  }
+
+  if (!rfid.PICC_ReadCardSerial()) {
+    Serial.println("RFID card detected, but UID could not be read.");
+    return;
+  }
+
+  String uid = readRfidUid();
+  latestRfidUid = uid;
+
+  Serial.print("RFID detected: ");
+  Serial.println(uid);
+
+  unsigned long nowMs = millis();
+  bool sameUidTooSoon = uid == lastPausedRfidUid && nowMs - lastRfidPauseMs < RFID_REPEAT_PAUSE_GUARD_MS;
+
+  if (task2Mode && robotState == STATE_FOLLOW_LINE && !lineOnlyMode && !sameUidTooSoon) {
+    lastPausedRfidUid = uid;
+    lastRfidPauseMs = nowMs;
+    startRfidPause(uid);
+  }
+
+  rfid.PICC_HaltA();
+  rfid.PCD_StopCrypto1();
+}
+
 bool isLeftRightAngleBend(const LineSnapshot &snapshot, bool tJunctionCandidate, bool hollowCrossCandidate) {
   return !tJunctionCandidate &&
          !hollowCrossCandidate &&
@@ -497,18 +590,22 @@ void startRobot() {
   lineOnlyMode = false;
   task2Mode = true;
   task2FirstTJunctionHandled = false;
+  lastPausedRfidUid = "";
+  lastRfidPauseMs = 0;
   resetDetectionCounters();
   lastError = 0;
   lineLostLatched = false;
   lastLineSeenMs = millis();
   enterState(STATE_FOLLOW_LINE);
-  Serial.println("Trial Run 2 Task 2 started. First T junction will turn right.");
+  Serial.println("Trial Run 2 Task 2 started. First T junction will turn left.");
 }
 
 void startLineOnlyRobot() {
   lineOnlyMode = true;
   task2Mode = false;
   task2FirstTJunctionHandled = false;
+  lastPausedRfidUid = "";
+  lastRfidPauseMs = 0;
   resetDetectionCounters();
   lastError = 0;
   lineLostLatched = false;
@@ -533,8 +630,8 @@ void handleTurnDecision(const char *sourceName) {
 
   if (task2Mode && !task2FirstTJunctionHandled) {
     task2FirstTJunctionHandled = true;
-    Serial.println("TASK2_FORCE_RIGHT");
-    pendingTurn = TURN_RIGHT;
+    Serial.println("TASK2_FORCE_LEFT");
+    pendingTurn = TURN_LEFT;
     enterState(STATE_PRE_TURN);
     return;
   }
@@ -647,6 +744,17 @@ void updateStateMachine() {
 
   if (robotState == STATE_FOLLOW_LINE) {
     followLine(snapshot);
+  } else if (robotState == STATE_RFID_PAUSE) {
+    stopDrive();
+
+    if (elapsed >= RFID_PAUSE_MS) {
+      if (snapshot.linePresent) {
+        lastError = snapshot.position - CENTER_POSITION;
+        lastLineSeenMs = millis();
+      }
+
+      enterState(STATE_FOLLOW_LINE);
+    }
   } else if (robotState == STATE_PRE_TURN) {
     setDriveSpeeds(PRE_TURN_SPEED, PRE_TURN_SPEED);
 
@@ -660,7 +768,7 @@ void updateStateMachine() {
       }
     }
   } else if (robotState == STATE_TURN_LEFT) {
-    // Pivot turn only: left front/rear reverse, right front/rear forward.
+    // Pivot turn only. Direction is calibrated for the current chassis wiring.
     int pivotSpeed = elapsed < PIVOT_KICK_MS + TURN_BOOST_MS ? TURN_BOOST_SPEED : TURN_SPEED;
 
     if (elapsed < PIVOT_KICK_MS) {
@@ -682,7 +790,7 @@ void updateStateMachine() {
       enterState(STATE_RECOVER_LINE);
     }
   } else if (robotState == STATE_TURN_RIGHT) {
-    // Pivot turn only: left front/rear forward, right front/rear reverse.
+    // Pivot turn only. Direction is calibrated for the current chassis wiring.
     int pivotSpeed = elapsed < PIVOT_KICK_MS + TURN_BOOST_MS ? TURN_BOOST_SPEED : TURN_SPEED;
 
     if (elapsed < PIVOT_KICK_MS) {
@@ -807,7 +915,15 @@ void printSnapshot(const LineSnapshot &snapshot) {
   Serial.print(" LA=");
   Serial.print(leftAngleFrames);
   Serial.print(" RA=");
-  Serial.println(rightAngleFrames);
+  Serial.print(rightAngleFrames);
+  Serial.print(" RFID=");
+  if (!rfidReady) {
+    Serial.println("NOT_FOUND");
+  } else if (latestRfidUid.length() == 0) {
+    Serial.println("READY");
+  } else {
+    Serial.println(latestRfidUid);
+  }
 }
 
 void printCurrentSnapshot() {
@@ -818,7 +934,7 @@ void printCurrentSnapshot() {
 void printHelp() {
   Serial.println();
   Serial.println("--- Trial Run 2 Task 2 ---");
-  Serial.println("g = start Task 2: first T junction turns right");
+  Serial.println("g = start Task 2: first T junction turns left");
   Serial.println("2 = start Task 2, same as g");
   Serial.println("o = start line-only following, no junction state machine");
   Serial.println("s = stop");
@@ -826,6 +942,7 @@ void printHelp() {
   Serial.println("p = print one sensor snapshot");
   Serial.println("m = toggle live sensor monitor");
   Serial.println("l/r/x = debug only: decision for any extra T junction");
+  Serial.println("RFID read during Task 2 pauses briefly, then resumes line following");
   Serial.println("Right-angle bends auto-turn: left bend -> left, right bend -> right");
   Serial.println("a = force left right-angle turn state");
   Serial.println("d = force right right-angle turn state");
@@ -912,6 +1029,7 @@ void setup() {
 
   Serial.println("Initializing Motorons on Wire1...");
   Wire1.begin();
+  Wire1.setClock(400000);
   delay(100);
 
   leftController.setBus(&Wire1);
@@ -920,6 +1038,17 @@ void setup() {
   rightController.setBus(&Wire1);
   rightController.setAddress(17);
   setupMotoron(&rightController, "Right 0x11");
+
+  if (isI2cDevicePresent(RFID_I2C_ADDRESS)) {
+    rfidReady = true;
+    Serial.println("RFID module found at I2C address 0x28.");
+  } else {
+    rfidReady = false;
+    Serial.println("RFID module not found at I2C address 0x28.");
+    Serial.println("Check WS1850S wiring on Wire1: SDA1/SCL1, 5V, GND.");
+  }
+
+  rfid.PCD_Init();
 
   stopDrive();
   enterState(STATE_IDLE);
@@ -934,6 +1063,7 @@ void setup() {
 void loop() {
   handleSerialCommands();
   handleButtons();
+  pollRFID();
   updateStateMachine();
   updateStatusLED();
   delay(10);
