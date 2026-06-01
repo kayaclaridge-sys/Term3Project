@@ -41,11 +41,13 @@ const float TOUCH_ZONE_CM = 12.0;
 
 // Motor commands are intentionally conservative to avoid a hard hit.
 const int CRUISE_COMMAND = 260;
+const int START_BOOST_COMMAND = 320;
 const int CREEP_COMMAND = 105;
 const int TOUCH_COMMAND = 62;
 const int NO_DISTANCE_COMMAND = 130;
 const int CONTACT_HOLD_COMMAND = 45;
 
+const unsigned long START_BOOST_MS = 650;
 const unsigned long CONTACT_HOLD_MS = 450;
 const unsigned long CONTACT_DEBOUNCE_MS = 35;
 const unsigned long CONTACT_LOST_RETURN_MS = 140;
@@ -761,8 +763,17 @@ void handleD32StartButton() {
 
 int calculateApproachCommand() {
   int cruise = constrain(CRUISE_COMMAND + speedTrimCommand, CREEP_COMMAND, MOTOR_MAX_SPEED);
+  int startBoost = constrain(START_BOOST_COMMAND + speedTrimCommand, cruise, MOTOR_MAX_SPEED);
   int creep = constrain(CREEP_COMMAND + speedTrimCommand / 2, TOUCH_COMMAND, cruise);
   int touch = constrain(TOUCH_COMMAND + speedTrimCommand / 3, 35, creep);
+
+  bool startBoostActive = reviveState == STATE_APPROACH &&
+                          millis() - missionStartMs < START_BOOST_MS &&
+                          (!hasFreshFrontDistance() || frontDistanceFilteredCm > CREEP_START_CM);
+
+  if (startBoostActive) {
+    return startBoost;
+  }
 
   if (!hasFreshFrontDistance()) {
     if (frontDistanceFilteredCm > 0.0 && frontDistanceFilteredCm <= TOUCH_ZONE_CM) {
@@ -921,26 +932,14 @@ void updateReviveStateMachine() {
 // =====================================================
 
 void updateStatusLED() {
-  if (reviveState == STATE_FAULT) {
-    bool blinkOn = ((millis() / 180) % 2) == 0;
-    digitalWrite(LED_RED_PIN, blinkOn ? HIGH : LOW);
-    digitalWrite(LED_GREEN_PIN, LOW);
-    return;
-  }
-
   if (reviveState == STATE_DONE) {
     digitalWrite(LED_RED_PIN, LOW);
     digitalWrite(LED_GREEN_PIN, HIGH);
     return;
   }
 
-  bool running = reviveState == STATE_APPROACH ||
-                 reviveState == STATE_DECEL ||
-                 reviveState == STATE_CREEP ||
-                 reviveState == STATE_CONTACT_HOLD;
-
-  digitalWrite(LED_RED_PIN, running ? LOW : HIGH);
-  digitalWrite(LED_GREEN_PIN, running ? HIGH : LOW);
+  digitalWrite(LED_RED_PIN, HIGH);
+  digitalWrite(LED_GREEN_PIN, LOW);
 }
 
 void printTelemetry() {
