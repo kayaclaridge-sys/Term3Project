@@ -902,7 +902,8 @@ void updateReviveStateMachine() {
 // =====================================================
 
 void updateStatusLED() {
-  bool contactButtonHeld = startReviveButtonDown || auxReviveButtonDown;
+  bool contactButtonHeld = (d32ReleasedAfterStart && startReviveButtonDown) ||
+                           auxReviveButtonDown;
 
   if (reviveState == STATE_DONE && contactButtonHeld) {
     digitalWrite(LED_RED_PIN, LOW);
