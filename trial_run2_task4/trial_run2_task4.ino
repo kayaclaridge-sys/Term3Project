@@ -436,11 +436,19 @@ void driveStraight(float distCm) {
 }
 
 // ===========================================================================
-//  PRIMITIVE 2: drive forward one cell (25 cm + RFID presence confirm)
+//  PRIMITIVE 2: drive forward one or more cells + RFID presence confirm
 //  Returns true when distance is reached and an RFID marker is detected.
 // ===========================================================================
-bool driveOneHop() {
-  Serial.println("  hop 25 cm, waiting for RFID marker");
+bool driveCells(int cellCount = 1) {
+  if (cellCount < 1) return true;
+
+  long targetCounts = TARGET_COUNTS * (long)cellCount;
+  long maxCounts = targetCounts + (MAX_COUNTS - TARGET_COUNTS);
+  long rfidArmCounts = targetCounts - (long)(TARGET_COUNTS * (1.0f - RFID_ARM_FRACTION));
+  unsigned long segmentTimeoutMs = HOP_TIMEOUT_MS * (unsigned long)cellCount;
+
+  Serial.print("  drive "); Serial.print(cellCount);
+  Serial.println(cellCount == 1 ? " cell, waiting for RFID marker" : " cells, waiting for RFID marker");
 
   bool tagSeen = false;
   resetEncoders();
@@ -454,7 +462,7 @@ bool driveOneHop() {
     updateHeading();
     if (abortRequested) { stopMotors(); return false; }
 
-    if (millis() - hopStartMs > HOP_TIMEOUT_MS) {
+    if (millis() - hopStartMs > segmentTimeoutMs) {
       stopMotors(); Serial.println("  HOP TIMEOUT"); return false;
     }
 
@@ -468,8 +476,9 @@ bool driveOneHop() {
     long avgCounts = (lc + rc) / 2;
     float distCm = avgCounts * MM_PER_COUNT / 10.0f;
 
-    bool rfidArmed = avgCounts >= (long)(TARGET_COUNTS * RFID_ARM_FRACTION);
-    // Poll RFID every 50 ms after the hop is far enough from the previous tag.
+    bool rfidArmed = avgCounts >= rfidArmCounts;
+    // Poll RFID near the final marker so earlier markers in a multi-cell run
+    // do not stop the segment early.
     if (rfidArmed && millis() - lastRfidPollMs >= 50) {
       lastRfidPollMs = millis();
       if (readRfidPresent()) {
@@ -478,11 +487,11 @@ bool driveOneHop() {
       }
     }
 
-    if (avgCounts > MAX_COUNTS) {
+    if (avgCounts > maxCounts) {
       stopMotors(); Serial.println("  DISTANCE CAP, no RFID marker"); return false;
     }
 
-    bool distOK = (avgCounts >= TARGET_COUNTS);
+    bool distOK = (avgCounts >= targetCounts);
     if (distOK && tagSeen) { stopMotors(); break; }
 
     int baseSpeed = (avgCounts < (long)(TARGET_COUNTS * SLOWDOWN_FRACTION))
@@ -549,9 +558,9 @@ void runFixedPath() {
   // ---- Segment 1: face NORTH, drive FIXED_NORTH_1 nodes -------------------
   Serial.println("--- SEG 1: North ---");
   if (ok && !turnToFacing(F_NORTH)) ok = false;
-  for (int i = 0; i < FIXED_NORTH_1 && ok; i++) {
-    if (abortRequested || millis() - pathStartMs > PATH_TIMEOUT_MS) { ok = false; break; }
-    if (!driveOneHop()) { ok = false; break; }
+  if (ok && FIXED_NORTH_1 > 0) {
+    if (abortRequested || millis() - pathStartMs > PATH_TIMEOUT_MS) ok = false;
+    else if (!driveCells(FIXED_NORTH_1)) ok = false;
   }
 
   // ---- Segment 2: face EAST / WEST, drive FIXED_EAST_NODES nodes ----------
@@ -563,9 +572,9 @@ void runFixedPath() {
     driveStraight(PRE_TURN_CM);
     if (!turnToFacing(sideFacing)) ok = false;
   }
-  for (int i = 0; i < FIXED_EAST_NODES && ok; i++) {
-    if (abortRequested || millis() - pathStartMs > PATH_TIMEOUT_MS) { ok = false; break; }
-    if (!driveOneHop()) { ok = false; break; }
+  if (ok && FIXED_EAST_NODES > 0) {
+    if (abortRequested || millis() - pathStartMs > PATH_TIMEOUT_MS) ok = false;
+    else if (!driveCells(FIXED_EAST_NODES)) ok = false;
   }
 
   // ---- Segment 3: face NORTH, drive FIXED_NORTH_2 nodes -------------------
@@ -575,9 +584,9 @@ void runFixedPath() {
     driveStraight(PRE_TURN_CM);
     if (!turnToFacing(F_NORTH)) ok = false;
   }
-  for (int i = 0; i < FIXED_NORTH_2 && ok; i++) {
-    if (abortRequested || millis() - pathStartMs > PATH_TIMEOUT_MS) { ok = false; break; }
-    if (!driveOneHop()) { ok = false; break; }
+  if (ok && FIXED_NORTH_2 > 0) {
+    if (abortRequested || millis() - pathStartMs > PATH_TIMEOUT_MS) ok = false;
+    else if (!driveCells(FIXED_NORTH_2)) ok = false;
   }
 
   // ---- Done ----------------------------------------------------------------
@@ -610,7 +619,7 @@ void runSingleHop() {
 
   if (imuPresent) calibrateGyroBias();
 
-  bool ok = driveOneHop();
+  bool ok = driveCells(1);
 
   digitalWrite(LED_RED, HIGH); digitalWrite(LED_GREEN, LOW);
   sysState = SYS_IDLE;
