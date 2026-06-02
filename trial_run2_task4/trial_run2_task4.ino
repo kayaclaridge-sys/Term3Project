@@ -52,7 +52,7 @@ const unsigned long PATH_TIMEOUT_MS = 60000UL;  // 1-minute task budget
 //   Segment 2: turn and drive FIXED_EAST_NODES nodes sideways
 //   Segment 3: turn back north and drive FIXED_NORTH_2 nodes
 //   FIXED_TURN_RIGHT: true = turn east (+col), false = turn west (-col)
-const int  FIXED_NORTH_1    = 1;     // 1 node forward
+const int  FIXED_NORTH_1    = 2;     // 2 nodes forward
 const int  FIXED_EAST_NODES = 1;     // 1 node right (east)
 const int  FIXED_NORTH_2    = 1;     // 1 node forward
 const bool FIXED_TURN_RIGHT = true;  // right turn = east (+col)
@@ -90,7 +90,7 @@ const float TURN_90_DEG = 120.0f;
 // the next segment. Tune freely.
 const float PRE_TURN_CM = 2.0f;
 const unsigned long TURN_TIMEOUT_MS = 4000UL;
-const unsigned long TURN_SETTLE_MS  = 200UL;
+const unsigned long TURN_SETTLE_MS  = 50UL;
 
 // ---- IMU calibration -------------------------------------------------------
 const int  GYRO_CAL_SAMPLES   = 200;
@@ -552,7 +552,6 @@ void runFixedPath() {
   for (int i = 0; i < FIXED_NORTH_1 && ok; i++) {
     if (abortRequested || millis() - pathStartMs > PATH_TIMEOUT_MS) { ok = false; break; }
     if (!driveOneHop()) { ok = false; break; }
-    delay(200);
   }
 
   // ---- Segment 2: face EAST / WEST, drive FIXED_EAST_NODES nodes ----------
@@ -567,7 +566,6 @@ void runFixedPath() {
   for (int i = 0; i < FIXED_EAST_NODES && ok; i++) {
     if (abortRequested || millis() - pathStartMs > PATH_TIMEOUT_MS) { ok = false; break; }
     if (!driveOneHop()) { ok = false; break; }
-    delay(200);
   }
 
   // ---- Segment 3: face NORTH, drive FIXED_NORTH_2 nodes -------------------
@@ -580,7 +578,6 @@ void runFixedPath() {
   for (int i = 0; i < FIXED_NORTH_2 && ok; i++) {
     if (abortRequested || millis() - pathStartMs > PATH_TIMEOUT_MS) { ok = false; break; }
     if (!driveOneHop()) { ok = false; break; }
-    delay(200);
   }
 
   // ---- Done ----------------------------------------------------------------
