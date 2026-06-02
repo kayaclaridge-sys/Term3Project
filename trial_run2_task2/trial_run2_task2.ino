@@ -79,7 +79,7 @@ MFRC522_I2C rfid(RFID_I2C_ADDRESS, RFID_RESET_PIN, &Wire1);
 
 // -------------------- Junction detection tuning --------------------
 const uint8_t SPECIAL_DETECT_FRAMES = 3;
-const uint8_t RIGHT_ANGLE_DETECT_FRAMES = 1;
+const uint8_t RIGHT_ANGLE_DETECT_FRAMES = 3;
 const unsigned long PRE_TURN_MS = 110;
 const unsigned long PIVOT_KICK_MS = 0;
 const unsigned long TURN_BOOST_MS = 500;
