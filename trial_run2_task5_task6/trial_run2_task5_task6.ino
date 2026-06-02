@@ -130,6 +130,7 @@ const float ULTRASONIC_MAX_VALID_CM = 120.0;
 
 // Target is equal raw ultrasonic sensor-to-wall readings on both sides.
 const float WALL_EQUALITY_TARGET_DELTA_CM = 0.0;
+const float WALL_ENTRY_MAX_CM = 10.0;
 const float WALL_DEADBAND_CM = 0.35;
 const float WALL_KP = 70.0;
 const float WALL_KD = 1.5;
@@ -1152,14 +1153,19 @@ void updateRampStateMachine() {
   if (rampState == STATE_APPROACH) {
     applyStraightApproachDrive(approachTargetTicksPerSec);
 
-    if (climbModeActive && rampEnterFrames >= ENTER_CONFIRM_FRAMES) {
+    bool bothWallsClose = isDistanceValid(leftDistanceCm) &&
+                          isDistanceValid(rightDistanceCm) &&
+                          leftDistanceCm <= WALL_ENTRY_MAX_CM &&
+                          rightDistanceCm <= WALL_ENTRY_MAX_CM;
+
+    if (bothWallsClose) {
       enterState(STATE_ON_RAMP);
       return;
     }
 
     long approachTicks = abs(forwardTicks() - runStartTicks);
     if (approachTicks > APPROACH_MAX_TICKS) {
-      stopWithFault("Ramp pitch was not detected during approach.");
+      stopWithFault("Both side walls were not detected during approach.");
     }
   } else if (rampState == STATE_ON_RAMP) {
     int target = selectedProfile == PROFILE_ASCEND
@@ -1317,7 +1323,7 @@ void printHelp() {
   Serial.println("g = start selected profile");
   Serial.println("s = stop");
   Serial.println("Task 6 left/right ultrasonic wall equality hold is always on");
-  Serial.println("climb mode auto-enters on sustained pitch and exits after sustained flat pitch");
+  Serial.println("wall following starts when both side walls are within 10cm");
   Serial.println("c = recalibrate IMU on flat ground");
   Serial.println("z = reset encoders and yaw");
   Serial.println("p = print telemetry");
