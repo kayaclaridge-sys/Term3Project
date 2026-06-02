@@ -77,7 +77,7 @@ const float IMU_YAW_SIGN     = -1.0f;   // flip to -1.0 if gyro Z sign is revers
 const int   TURN_SPEED_FAST       = 550;   // needs to be high enough to pivot all 4 wheels
 const int   TURN_SPEED_SLOW       = 150;   // must be high enough to overcome stiction
 const float TURN_SLOW_THRESHOLD_DEG   = 40.0f;
-const float TURN_OVERSHOOT_BUFFER_DEG =  4.0f;
+const float TURN_OVERSHOOT_BUFFER_DEG =  2.0f;
 // Gyro overreads on this hardware: physical 50° = ~90° heading.
 // TURN_90_DEG is the heading target that produces a physical 90° turn.
 // Formula: TURN_90_DEG = 90 * (observed_heading / observed_physical)
