@@ -131,6 +131,7 @@ const float ULTRASONIC_MAX_VALID_CM = 120.0;
 // Target is equal raw ultrasonic sensor-to-wall readings on both sides.
 const float WALL_EQUALITY_TARGET_DELTA_CM = 0.0;
 const float WALL_ENTRY_MAX_CM = 10.0;
+const float WALL_EXIT_MIN_CM = 15.0;
 const float WALL_DEADBAND_CM = 0.35;
 const float WALL_KP = 70.0;
 const float WALL_KD = 1.5;
@@ -156,6 +157,7 @@ int lastBalanceCorrection = 0;
 bool lastPivotAssistActive = false;
 
 unsigned long lastDistanceMs = 0;
+unsigned long lastWallConditionFrameMs = 0;
 unsigned long previousWallMs = 0;
 unsigned long lastLeftDistanceSeenMs = 0;
 unsigned long lastRightDistanceSeenMs = 0;
@@ -215,6 +217,8 @@ const uint8_t ENTER_CONFIRM_FRAMES = 5;
 const uint8_t EXIT_CONFIRM_FRAMES = 3;
 const uint8_t CLIMB_MODE_ENTER_FRAMES = 3;
 const uint8_t CLIMB_MODE_EXIT_FRAMES = 3;
+const uint8_t WALL_ENTRY_CONFIRM_FRAMES = 3;
+const uint8_t WALL_EXIT_CONFIRM_FRAMES = 5;
 
 // Distance/time limits protect against a missed sensor reading.
 const long APPROACH_MAX_TICKS = 2200;
@@ -242,6 +246,8 @@ uint8_t rampEnterFrames = 0;
 uint8_t flatExitFrames = 0;
 uint8_t climbModeEnterFrames = 0;
 uint8_t climbModeExitFrames = 0;
+uint8_t wallEntryFrames = 0;
+uint8_t wallExitFrames = 0;
 bool climbModeActive = false;
 
 int currentLeftCommand = 0;
@@ -792,6 +798,20 @@ int calculateWallCorrection() {
   return (int)lastWallCorrection;
 }
 
+bool bothSideDistancesAtMost(float distanceCm) {
+  return isDistanceValid(leftDistanceCm) &&
+         isDistanceValid(rightDistanceCm) &&
+         leftDistanceCm <= distanceCm &&
+         rightDistanceCm <= distanceCm;
+}
+
+bool bothSideDistancesAtLeast(float distanceCm) {
+  return isDistanceValid(leftDistanceCm) &&
+         isDistanceValid(rightDistanceCm) &&
+         leftDistanceCm >= distanceCm &&
+         rightDistanceCm >= distanceCm;
+}
+
 // =====================================================
 // Motor helpers
 // =====================================================
@@ -881,6 +901,8 @@ void enterState(RampState nextState) {
     rampStartTicks = forwardTicks();
     rampEnterFrames = 0;
     flatExitFrames = 0;
+    wallExitFrames = 0;
+    lastWallConditionFrameMs = 0;
     stallStartedMs = 0;
   } else if (nextState == STATE_EXIT_CLEAR) {
     exitStartTicks = forwardTicks();
@@ -1100,6 +1122,9 @@ void resetRampRunVariables() {
   flatExitFrames = 0;
   climbModeEnterFrames = 0;
   climbModeExitFrames = 0;
+  wallEntryFrames = 0;
+  wallExitFrames = 0;
+  lastWallConditionFrameMs = 0;
   climbModeActive = false;
   faultMessage[0] = '\0';
 }
@@ -1108,8 +1133,7 @@ void startRampRun(RampProfile profile) {
   selectedProfile = profile;
 
   if (!imuReady) {
-    stopWithFault("MPU6050 is not ready.");
-    return;
+    Serial.println("MPU6050 is not ready; using ultrasonic entry/exit.");
   }
 
   resetRampRunVariables();
@@ -1145,12 +1169,19 @@ void updateRampStateMachine() {
   if (rampState == STATE_APPROACH) {
     applyStraightApproachDrive(approachTargetTicksPerSec);
 
-    bool bothWallsClose = isDistanceValid(leftDistanceCm) &&
-                          isDistanceValid(rightDistanceCm) &&
-                          leftDistanceCm <= WALL_ENTRY_MAX_CM &&
-                          rightDistanceCm <= WALL_ENTRY_MAX_CM;
+    if (lastDistanceMs != lastWallConditionFrameMs) {
+      lastWallConditionFrameMs = lastDistanceMs;
 
-    if (bothWallsClose) {
+      if (bothSideDistancesAtMost(WALL_ENTRY_MAX_CM)) {
+        if (wallEntryFrames < 255) {
+          wallEntryFrames++;
+        }
+      } else {
+        wallEntryFrames = 0;
+      }
+    }
+
+    if (wallEntryFrames >= WALL_ENTRY_CONFIRM_FRAMES) {
       enterState(STATE_ON_RAMP);
       return;
     }
@@ -1168,7 +1199,19 @@ void updateRampStateMachine() {
 
     long rampTicks = abs(forwardTicks() - rampStartTicks);
 
-    if (flatExitFrames >= EXIT_CONFIRM_FRAMES) {
+    if (lastDistanceMs != lastWallConditionFrameMs) {
+      lastWallConditionFrameMs = lastDistanceMs;
+
+      if (bothSideDistancesAtLeast(WALL_EXIT_MIN_CM)) {
+        if (wallExitFrames < 255) {
+          wallExitFrames++;
+        }
+      } else {
+        wallExitFrames = 0;
+      }
+    }
+
+    if (wallExitFrames >= WALL_EXIT_CONFIRM_FRAMES) {
       finishRun();
       return;
     }
@@ -1307,7 +1350,8 @@ void printHelp() {
   Serial.println("g = start selected profile");
   Serial.println("s = stop");
   Serial.println("Task 6 left/right ultrasonic wall equality hold is always on");
-  Serial.println("wall following starts when both side walls are within 10cm");
+  Serial.println("wall following starts after both side distances are under 10cm for 3 frames");
+  Serial.println("run stops after both side distances are over 15cm for 5 frames");
   Serial.println("c = recalibrate IMU on flat ground");
   Serial.println("z = reset encoders and yaw");
   Serial.println("p = print telemetry");
