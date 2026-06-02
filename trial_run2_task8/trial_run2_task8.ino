@@ -43,7 +43,7 @@ const float TOUCH_ZONE_CM = 12.0;
 const int CRUISE_COMMAND = 260;
 const int START_BOOST_COMMAND = 320;
 const int CREEP_COMMAND = 125;
-const int TOUCH_COMMAND = 90;
+const int TOUCH_COMMAND = 100;
 const int NO_DISTANCE_COMMAND = 130;
 
 const unsigned long START_BOOST_MS = 650;
