@@ -52,19 +52,19 @@ const int SHARP_CURVE_BASE_SPEED = 180;
 const int MAX_SPEED = 650;
 const int MAX_TURN = 650;
 const int SEARCH_SPEED = 220;
-const int CURVE_MIN_TURN = 330;
-const int CURVE_EXTRA_TURN = 160;
-const int CURVE_SEARCH_INNER_SPEED = -140;
-const int CURVE_SEARCH_OUTER_SPEED = 400;
+const int CURVE_MIN_TURN = 360;
+const int CURVE_EXTRA_TURN = 180;
+const int CURVE_SEARCH_INNER_SPEED = -160;
+const int CURVE_SEARCH_OUTER_SPEED = 420;
 
 const int CURVE_SIDE_SUM_MARGIN = 350;
 const int CURVE_POSITION_MARGIN = 350;
 const uint8_t CURVE_DETECT_FRAMES = 2;
 
-const float KP = 0.13;
-const float KD = 0.85;
-const float CURVE_KP = 0.24;
-const float CURVE_KD = 1.05;
+const float KP = 0.14;
+const float KD = 0.90;
+const float CURVE_KP = 0.26;
+const float CURVE_KD = 1.10;
 
 int lastError = 0;
 
