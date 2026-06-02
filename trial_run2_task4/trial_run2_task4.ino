@@ -83,7 +83,7 @@ const float TURN_OVERSHOOT_BUFFER_DEG =  4.0f;
 // Formula: TURN_90_DEG = 90 * (observed_heading / observed_physical)
 //          = 90 * (86 / 50) ≈ 155  (+4 for the buffer) = 158
 // If turns are still short → increase; if they overshoot → decrease.
-const float TURN_90_DEG = 120.0f;
+const float TURN_90_DEG = 90.0f;
 
 // ---- Pre-turn alignment ------------------------------------------------
 // Before each 90-degree turn the robot drives this far, then turns into
@@ -605,7 +605,7 @@ void runFixedPath() {
 }
 
 // ===========================================================================
-//  SINGLE-HOP MISSION (button D32 / 'g')
+//  SINGLE-HOP DEBUG MISSION (serial 'g' only)
 // ===========================================================================
 
 void runSingleHop() {
