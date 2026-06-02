@@ -192,7 +192,7 @@ RampState rampState = STATE_IDLE;
 
 // Encoder-speed targets. Adjust after one short bench run.
 int approachTargetTicksPerSec = 320;
-int ascendTargetTicksPerSec = 280;
+int ascendTargetTicksPerSec = 300;
 int descendTargetTicksPerSec = 320;
 int exitTargetTicksPerSec = 300;
 int speedTrimTicksPerSec = 0;
