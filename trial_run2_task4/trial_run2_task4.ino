@@ -2,20 +2,17 @@
  * dead_reckoning_hop.ino
  * Arduino Giga R1 WiFi - Task 4: Open-Field Dead Reckoning
  *
- * Three modes:
- *   1) SINGLE HOP    - 'g'. Robot drives 25 cm forward with encoder + IMU + RFID.
- *   2) PATH MISSION  - "go R7C2" (or "path R3C5 R7C2 N"). Free-form pathfinder.
- *   3) FIXED PATH    - Start button or 'm'. Executes the Fig. 1 staircase:
+ * Main modes:
+ *   1) SINGLE HOP    - 'g'. Robot drives 25 cm forward with encoder + IMU
+ *                      and stops only after an RFID marker is present.
+ *   2) FIXED PATH    - Start button or 'm'. Executes the Fig. 1 staircase:
  *                        Seg 1: FIXED_NORTH_1 nodes north
  *                        Seg 2: FIXED_EAST_NODES sideways (east or west)
  *                        Seg 3: FIXED_NORTH_2 nodes north
- *                      Robot reads and logs every RFID tag it passes over.
+ *                      RFID is presence-only; tag identity is ignored.
  *
- * Compass convention (grid-relative):
- *   N = toward HIGHER row numbers (R1 -> R9 direction)
- *   S = toward LOWER  row numbers
- *   E = toward HIGHER column numbers (C1 -> C9 direction)
- *   W = toward LOWER  column numbers
+ * Compass convention:
+ *   N / E / S / W are relative to how the robot is placed at the start.
  *
  * Sensors / hardware:
  *   Wire   (D20/D21)  : MPU6050 0x68
@@ -28,13 +25,8 @@
  *   m                       FIXED PATH mission (Fig. 1 staircase) ← main Task 4
  *   g                       single 25 cm hop (debug)
  *   s                       abort current motion
- *   face N|E|S|W            set current facing
- *   at R#C#                 set current cell
- *   pose R#C# N|E|S|W       set full pose in one line
- *   go R#C#                 pathfind from current pose to R#C#
- *   path R#C# R#C# [F]      shortcut: set pose, then go
- *   d                       sensor + pose telemetry
- *   r                       single RFID read
+ *   d                       sensor telemetry
+ *   r                       RFID presence read
  *   i                       IMU live read
  *   c                       recalibrate gyro bias
  *   z                       zero encoders
@@ -65,12 +57,6 @@ const int  FIXED_EAST_NODES = 1;     // 1 node right (east)
 const int  FIXED_NORTH_2    = 1;     // 1 node forward
 const bool FIXED_TURN_RIGHT = true;  // right turn = east (+col)
 
-// ---- Fallback start pose (used when no RFID tag is read at startup) --------
-//   Set these to match where you place the robot on the grid before pressing
-//   the start button.  If the start RFID tag IS read, these are ignored.
-const uint8_t FALLBACK_START_ROW = 1;   // row the robot starts on
-const uint8_t FALLBACK_START_COL = 1;   // column the robot starts on
-
 // ---- Robot mechanics -------------------------------------------------------
 const float WHEEL_DIAMETER_MM = 65.0f;
 const int   ENCODER_CPR       = 144;
@@ -99,10 +85,10 @@ const float TURN_OVERSHOOT_BUFFER_DEG =  4.0f;
 // If turns are still short → increase; if they overshoot → decrease.
 const float TURN_90_DEG = 120.0f;
 
-// ---- Post-turn alignment -----------------------------------------------
-// After each 90° turn the robot drives this far before the next hop,
-// so the RFID reader is re-centred over the tag grid.  Tune freely.
-const float POST_TURN_CM = 2.0f;
+// ---- Pre-turn alignment ------------------------------------------------
+// Before each 90-degree turn the robot drives this far, then turns into
+// the next segment. Tune freely.
+const float PRE_TURN_CM = 2.0f;
 const unsigned long TURN_TIMEOUT_MS = 4000UL;
 const unsigned long TURN_SETTLE_MS  = 200UL;
 
@@ -110,8 +96,10 @@ const unsigned long TURN_SETTLE_MS  = 200UL;
 const int  GYRO_CAL_SAMPLES   = 200;
 const int  GYRO_CAL_DELAY_MS  = 5;
 
-// ---- RFID timing (from reference test code) --------------------------------
-const unsigned long SAME_CARD_REPEAT_MS = 1500; // ignore same UID within this window
+// ---- RFID timing -----------------------------------------------------------
+// Ignore RFID until part-way through a hop so the start marker is not counted
+// as the next marker.
+const float RFID_ARM_FRACTION = 0.60f;
 
 // ---- Safety ----------------------------------------------------------------
 const float FRONT_SAFETY_CM   = 8.0f;
@@ -165,108 +153,15 @@ const byte MPU_I2C_ADDRESS  = 0x68;
 #define MPU_WHO_AM_I     0x75
 
 // ===========================================================================
-//  GRID MAP (UID -> row, col)
-//   Rows 9-6: lined area (top of arena)
-//   Rows 5-1: DEAD ZONE
+//  RFID NODE DETECTION
+//  RFID is used as a presence sensor only. Tag identity is ignored.
 // ===========================================================================
 
-struct CellEntry {
-  const char *uid;
-  uint8_t row;
-  uint8_t col;
-};
-
-const CellEntry GRID[] = {
-  // Row 9 (top, lined)
-  {"C3DFAA41",9,1},{"671BAB41",9,2},{"855AAB41",9,3},{"70CBAA41",9,4},{"6E54A641",9,5},
-  {"7447AB41",9,6},{"1B0AAB41",9,7},{"418BAB41",9,8},{"43DB2CDD",9,9},
-  // Row 8 (lined)
-  {"2802AB41",8,1},{"7074AB41",8,2},{"DF54A941",8,3},{"03CCAA41",8,4},{"1D65AA41",8,5},
-  {"F6B6A941",8,6},{"A42DAB41",8,7},{"F164AB41",8,8},{"A335126A",8,9},
-  // Row 7 (lined)
-  {"4A12AB41",7,1},{"685EAB41",7,2},{"E7F7AA41",7,3},{"9C01AB41",7,4},{"E238A941",7,5},
-  {"54C4AA41",7,6},{"8CE5AA41",7,7},{"4E4DAB41",7,8},{"28E3AA41",7,9},
-  // Row 6 (lined)
-  {"BD47AB41",6,1},{"F94FAB41",6,2},{"CE9CAA41",6,3},{"060DAB41",6,4},{"6666AA41",6,5},
-  {"B3DA2ADD",6,6},{"D3DDAA41",6,7},{"0D46AB41",6,8},{"A142AB41",6,9},
-  // Row 5 (DEAD ZONE begins)
-  {"5663AB41",5,1},{"0077AB41",5,2},{"48CBAA41",5,3},{"F85EAB41",5,4},{"4FC0AA41",5,5},
-  {"AE55AA41",5,6},{"41AB4141",5,7},{"FCD6AA41",5,8},{"D157AB41",5,9},
-  // Row 4
-  {"9259AB41",4,1},{"3D84AB41",4,2},{"70D7AA41",4,3},{"B811AB41",4,4},{"3ACEAA41",4,5},
-  {"6C5FAB41",4,6},{"F459AB41",4,7},{"47FAAA41",4,8},{"773DAB41",4,9},
-  // Row 3
-  {"7451AB41",3,1},{"B493AB41",3,2},{"6D19AB41",3,3},{"8A45AB41",3,4},{"9312AB41",3,5},
-  {"AC5CAB41",3,6},{"E840AB41",3,7},{"F052AB41",3,8},{"10C7AA41",3,9},
-  // Row 2
-  {"7C88AB41",2,1},{"2A60AB41",2,2},{"E74BA941",2,3},{"C47CAB41",2,4},{"BCCFAA41",2,5},
-  {"07F6AA41",2,6},{"3385AB41",2,7},{"573DAB41",2,8},{"F642AB41",2,9},
-  // Row 1 (bottom)
-  {"F07EAB41",1,1},{"528AAB41",1,2},{"375CAB41",1,3},{"8145A941",1,4},{"76F0AA41",1,5},
-  {"F63BAB41",1,6},{"9017AB41",1,7},{"390DAB41",1,8},{"1F27AB41",1,9},
-};
-const int GRID_SIZE = sizeof(GRID) / sizeof(GRID[0]);
-
-bool lookupUid(const String &uid, uint8_t &row, uint8_t &col) {
-  for (int i = 0; i < GRID_SIZE; i++) {
-    if (uid.equalsIgnoreCase(GRID[i].uid)) {
-      row = GRID[i].row; col = GRID[i].col; return true;
-    }
-  }
-  return false;
-}
-
-bool inDeadZone(uint8_t row) { return row >= 1 && row <= 5; }
-
 // ===========================================================================
-//  COMPASS / POSE
+//  COMPASS
 // ===========================================================================
 
-const char *FACING_NAME[] = { "N", "E", "S", "W" };
-
-uint8_t currentRow    = 0;
-uint8_t currentCol    = 0;
-Facing  currentFacing = F_NORTH;
-bool    poseKnown     = false;
-
-// Increment (dr, dc) when stepping one cell forward in the given facing
-void facingDelta(Facing f, int &dr, int &dc) {
-  dr = 0; dc = 0;
-  switch (f) {
-    case F_NORTH: dr =  1; break;
-    case F_SOUTH: dr = -1; break;
-    case F_EAST:  dc =  1; break;
-    case F_WEST:  dc = -1; break;
-  }
-}
-
-// Parse "R3C5" / "r3c5" / "3,5"
-bool parseCell(String s, uint8_t &r, uint8_t &c) {
-  s.trim(); s.toUpperCase();
-  int rIdx = s.indexOf('R');
-  int cIdx = s.indexOf('C');
-  if (rIdx >= 0 && cIdx > rIdx) {
-    long rr = s.substring(rIdx+1, cIdx).toInt();
-    long cc = s.substring(cIdx+1).toInt();
-    if (rr >= 1 && rr <= 9 && cc >= 1 && cc <= 9) { r=(uint8_t)rr; c=(uint8_t)cc; return true; }
-  }
-  int comma = s.indexOf(',');
-  if (comma > 0) {
-    long rr = s.substring(0, comma).toInt();
-    long cc = s.substring(comma+1).toInt();
-    if (rr >= 1 && rr <= 9 && cc >= 1 && cc <= 9) { r=(uint8_t)rr; c=(uint8_t)cc; return true; }
-  }
-  return false;
-}
-
-bool parseFacingChar(char ch, Facing &f) {
-  ch = toupper(ch);
-  if (ch == 'N') { f = F_NORTH; return true; }
-  if (ch == 'E') { f = F_EAST;  return true; }
-  if (ch == 'S') { f = F_SOUTH; return true; }
-  if (ch == 'W') { f = F_WEST;  return true; }
-  return false;
-}
+Facing currentFacing = F_NORTH;
 
 // ===========================================================================
 //  GLOBALS
@@ -292,9 +187,6 @@ unsigned long lastImuMs = 0;
 enum SystemState { SYS_IDLE, SYS_BUSY };
 volatile SystemState sysState = SYS_IDLE;
 volatile bool abortRequested = false;
-
-String latestRfidUid  = "";
-unsigned long lastRfidMs = 0;   // timestamp of last successfully-returned UID
 
 // Button state is now tracked via static locals inside handleButtons() — see teammate pattern.
 
@@ -429,49 +321,22 @@ void driveNow(int leftSpd, int rightSpd) {
   motorRight.setSpeedNow(1, r); motorRight.setSpeedNow(2, r); motorRight.setSpeedNow(3, r);
 }
 
-// uidToString: NO colons — must match the grid map entries above
-String uidToString() {
-  String uid = "";
-  for (byte i = 0; i < rfid.uid.size; i++) {
-    if (rfid.uid.uidByte[i] < 0x10) uid += "0";
-    uid += String(rfid.uid.uidByte[i], HEX);
-  }
-  uid.toUpperCase();
-  return uid;
-}
+bool readRfidPresent() {
+  if (!rfid.PICC_IsNewCardPresent()) return false;
+  if (!rfid.PICC_ReadCardSerial()) return false;
 
-// readRfidUid: lifted directly from reference test code.
-//   - returns "" when no card, unreadable card, or same card within SAME_CARD_REPEAT_MS
-//   - returns UID string on a genuine new-card (or repeat after timeout)
-String readRfidUid() {
-  if (!rfid.PICC_IsNewCardPresent()) return "";
-  if (!rfid.PICC_ReadCardSerial()) return "";
-
-  String uid = uidToString();
-
-  // same-card repeat suppression (reference code pattern)
-  if (uid == latestRfidUid && millis() - lastRfidMs < SAME_CARD_REPEAT_MS) {
-    rfid.PICC_HaltA();
-    rfid.PCD_StopCrypto1();
-    return "";
-  }
-
-  lastRfidMs = millis();
   rfid.PICC_HaltA();
   rfid.PCD_StopCrypto1();
-  return uid;
+  return true;
 }
 
-// captureTagBriefly: resets suppression window first so a fresh read is always attempted.
 // Uses 50 ms between attempts — matches reference code delay(50).
-String captureTagBriefly(int attempts = 25, int delayMs = 50) {
-  lastRfidMs = 0;          // clear same-card window — force fresh read
+bool captureTagBriefly(int attempts = 25, int delayMs = 50) {
   for (int i = 0; i < attempts; i++) {
-    String u = readRfidUid();
-    if (u.length() > 0) return u;
+    if (readRfidPresent()) return true;
     delay(delayMs);
   }
-  return "";
+  return false;
 }
 
 // ===========================================================================
@@ -481,7 +346,6 @@ void handleButtons();
 void handleSerial();
 void dumpStatus(const char *prefix);
 void dumpImu();
-void printPose(const char *prefix);
 
 // ===========================================================================
 //  PRIMITIVE 1: turn 90 degrees (CW = right, CCW = left)
@@ -542,7 +406,7 @@ bool turnToFacing(Facing target) {
 }
 
 // ===========================================================================
-//  Post-turn alignment drive — encoder only, no RFID required
+//  Short alignment drive — encoder only, no RFID required
 // ===========================================================================
 void driveStraight(float distCm) {
   if (distCm <= 0.0f) return;
@@ -572,17 +436,13 @@ void driveStraight(float distCm) {
 }
 
 // ===========================================================================
-//  PRIMITIVE 2: drive forward one cell (25 cm + RFID confirm)
-//  Returns true on success. Updates latestRfidUid as it goes.
+//  PRIMITIVE 2: drive forward one cell (25 cm + RFID presence confirm)
+//  Returns true when distance is reached and an RFID marker is detected.
 // ===========================================================================
-bool driveOneHop(uint8_t expectedRow, uint8_t expectedCol) {
-  if (expectedRow > 0) {
-    Serial.print("  hop -> R"); Serial.print(expectedRow); Serial.print("C"); Serial.println(expectedCol);
-  } else {
-    Serial.println("  hop (pose unconfirmed)");
-  }
+bool driveOneHop() {
+  Serial.println("  hop 25 cm, waiting for RFID marker");
 
-  String hopStartUid = latestRfidUid;
+  bool tagSeen = false;
   resetEncoders();
   resetHeading();
   unsigned long hopStartMs  = millis();
@@ -603,34 +463,27 @@ bool driveOneHop(uint8_t expectedRow, uint8_t expectedCol) {
       stopMotors(); Serial.println("  FRONT OBSTACLE"); return false;
     }
 
-    // Poll RFID every 50 ms — matches reference code cadence, keeps motor loop fast
-    if (millis() - lastRfidPollMs >= 50) {
-      lastRfidPollMs = millis();
-      String uid = readRfidUid();
-      if (uid.length() > 0 && uid != latestRfidUid) {
-        latestRfidUid = uid;
-        uint8_t tr, tc;
-        Serial.print("    [RFID] "); Serial.print(uid);
-        if (lookupUid(uid, tr, tc)) {
-          Serial.print("  -> R"); Serial.print(tr); Serial.print("C"); Serial.println(tc);
-        } else {
-          Serial.println("  (not in grid)");
-        }
-      }
-    }
-
     long lc = avgLeftCounts();
     long rc = avgRightCounts();
     long avgCounts = (lc + rc) / 2;
     float distCm = avgCounts * MM_PER_COUNT / 10.0f;
 
+    bool rfidArmed = avgCounts >= (long)(TARGET_COUNTS * RFID_ARM_FRACTION);
+    // Poll RFID every 50 ms after the hop is far enough from the previous tag.
+    if (rfidArmed && millis() - lastRfidPollMs >= 50) {
+      lastRfidPollMs = millis();
+      if (readRfidPresent()) {
+        tagSeen = true;
+        Serial.println("    [RFID] tag detected");
+      }
+    }
+
     if (avgCounts > MAX_COUNTS) {
-      stopMotors(); Serial.println("  DISTANCE CAP, no new RFID"); return false;
+      stopMotors(); Serial.println("  DISTANCE CAP, no RFID marker"); return false;
     }
 
     bool distOK = (avgCounts >= TARGET_COUNTS);
-    bool tagOK  = (latestRfidUid.length() > 0) && (latestRfidUid != hopStartUid);
-    if (distOK && tagOK) { stopMotors(); break; }
+    if (distOK && tagSeen) { stopMotors(); break; }
 
     int baseSpeed = (avgCounts < (long)(TARGET_COUNTS * SLOWDOWN_FRACTION))
                     ? CRUISE_SPEED : SCAN_SPEED;
@@ -649,123 +502,13 @@ bool driveOneHop(uint8_t expectedRow, uint8_t expectedCol) {
       Serial.print(" hdg=");    Serial.print(headingDeg, 1);
       Serial.print(" corr=");   Serial.print(correction);
       Serial.print(" rfid=");
-      Serial.println(latestRfidUid.length() ? latestRfidUid : String("(none)"));
+      Serial.println(tagSeen ? "seen" : (rfidArmed ? "armed" : "waiting"));
     }
     delay(3);
   }
 
-  // Update current pose based on RFID if known, else dead reckon
-  uint8_t r, c;
-  if (latestRfidUid.length() > 0 && lookupUid(latestRfidUid, r, c)) {
-    currentRow = r; currentCol = c;
-  } else {
-    int dr, dc; facingDelta(currentFacing, dr, dc);
-    currentRow = (uint8_t)constrain((int)currentRow + dr, 1, 9);
-    currentCol = (uint8_t)constrain((int)currentCol + dc, 1, 9);
-  }
-  Serial.print("  arrived at R"); Serial.print(currentRow); Serial.print("C"); Serial.println(currentCol);
+  Serial.println("  hop complete");
   return true;
-}
-
-// ===========================================================================
-//  PATH EXECUTION
-// ===========================================================================
-
-bool planAndExecute(uint8_t targetRow, uint8_t targetCol) {
-  if (!poseKnown) {
-    Serial.println("ERROR: pose unknown. Send 'face X' and 'at R#C#' first (or use 'pose R#C# F').");
-    return false;
-  }
-  if (targetRow < 1 || targetRow > 9 || targetCol < 1 || targetCol > 9) {
-    Serial.println("ERROR: target out of grid"); return false;
-  }
-  if (targetRow == currentRow && targetCol == currentCol) {
-    Serial.println("Already at target."); return true;
-  }
-
-  sysState = SYS_BUSY;
-  abortRequested = false;
-  digitalWrite(LED_RED, LOW); digitalWrite(LED_GREEN, HIGH);
-
-  unsigned long pathStartMs = millis();
-  int dRow = (int)targetRow - (int)currentRow;
-  int dCol = (int)targetCol - (int)currentCol;
-
-  Serial.println();
-  Serial.print("PATH PLAN: R"); Serial.print(currentRow); Serial.print("C"); Serial.print(currentCol);
-  Serial.print(" ("); Serial.print(FACING_NAME[currentFacing]); Serial.print(") -> R");
-  Serial.print(targetRow); Serial.print("C"); Serial.println(targetCol);
-  Serial.print("  dRow="); Serial.print(dRow); Serial.print(" dCol="); Serial.println(dCol);
-
-  // Pick axis order: if both nonzero, do the axis matching current facing first
-  bool rowsFirst;
-  if (dRow == 0)      rowsFirst = false;
-  else if (dCol == 0) rowsFirst = true;
-  else                rowsFirst = (currentFacing == F_NORTH || currentFacing == F_SOUTH);
-
-  for (int phase = 0; phase < 2; phase++) {
-    if (abortRequested) goto failure;
-    if (millis() - pathStartMs > PATH_TIMEOUT_MS) {
-      Serial.println("PATH TIMEOUT (45 s)"); goto failure;
-    }
-
-    int delta; Facing needed;
-    bool doRowPhase = (phase == 0) ? rowsFirst : !rowsFirst;
-    if (doRowPhase) {
-      delta = dRow;
-      needed = (dRow > 0) ? F_NORTH : F_SOUTH;
-    } else {
-      delta = dCol;
-      needed = (dCol > 0) ? F_EAST : F_WEST;
-    }
-    if (delta == 0) continue;
-
-    Serial.print("PHASE: face "); Serial.print(FACING_NAME[needed]);
-    Serial.print(", drive "); Serial.print(abs(delta)); Serial.println(" cells");
-
-    if (!turnToFacing(needed)) goto failure;
-
-    int dr, dc; facingDelta(currentFacing, dr, dc);
-    for (int i = 0; i < abs(delta); i++) {
-      if (abortRequested) goto failure;
-      if (millis() - pathStartMs > PATH_TIMEOUT_MS) {
-        Serial.println("PATH TIMEOUT (45 s)"); goto failure;
-      }
-      uint8_t expR = (uint8_t)constrain((int)currentRow + dr, 1, 9);
-      uint8_t expC = (uint8_t)constrain((int)currentCol + dc, 1, 9);
-      if (!driveOneHop(expR, expC)) goto failure;
-    }
-  }
-
-  // Success
-  stopMotors();
-  digitalWrite(LED_RED, HIGH); digitalWrite(LED_GREEN, LOW);
-  sysState = SYS_IDLE;
-  Serial.println();
-  Serial.print(">>> PATH SUCCESS <<<  arrived at R");
-  Serial.print(currentRow); Serial.print("C"); Serial.print(currentCol);
-  Serial.print(" facing "); Serial.print(FACING_NAME[currentFacing]);
-  Serial.print(" in "); Serial.print(millis() - pathStartMs); Serial.println(" ms");
-  return true;
-
-failure:
-  stopMotors();
-  digitalWrite(LED_RED, HIGH); digitalWrite(LED_GREEN, LOW);
-  sysState = SYS_IDLE;
-  Serial.print(">>> PATH FAILED <<< at R"); Serial.print(currentRow); Serial.print("C"); Serial.println(currentCol);
-  return false;
-}
-
-// ===========================================================================
-//  HELPER: one cell ahead of current pose in current facing
-//  Returns (0,0) if pose is not confirmed — driveOneHop treats 0 as "unknown".
-// ===========================================================================
-
-void nextExpectedCell(uint8_t &er, uint8_t &ec) {
-  if (!poseKnown || currentRow == 0 || currentCol == 0) { er = 0; ec = 0; return; }
-  int dr, dc; facingDelta(currentFacing, dr, dc);
-  er = (uint8_t)constrain((int)currentRow + dr, 1, 9);
-  ec = (uint8_t)constrain((int)currentCol + dc, 1, 9);
 }
 
 // ===========================================================================
@@ -777,8 +520,7 @@ void nextExpectedCell(uint8_t &er, uint8_t &ec) {
 //    Seg 2: face EAST (or WEST), drive FIXED_EAST_NODES nodes
 //    Seg 3: face NORTH, drive FIXED_NORTH_2 nodes
 //
-//  Every RFID tag detected in flight is printed immediately with its
-//  grid coordinates.  Pose is confirmed from RFID at each node.
+//  RFID only confirms that a marker exists at the end of each hop.
 // ===========================================================================
 
 void runFixedPath() {
@@ -792,36 +534,8 @@ void runFixedPath() {
   Serial.print  ("  Seg 3 : North  x"); Serial.println(FIXED_NORTH_2);
   Serial.println();
 
-  // ---- Try to auto-locate via RFID at starting node -----------------------
-  Serial.println("Scanning start RFID tag (3 s)...");
-  String startTag = captureTagBriefly(25, 60);
-  if (startTag.length() > 0) {
-    latestRfidUid = startTag;
-    uint8_t r, c;
-    if (lookupUid(startTag, r, c)) {
-      currentRow = r; currentCol = c; currentFacing = F_NORTH; poseKnown = true;
-      Serial.print("Start confirmed: R"); Serial.print(r);
-      Serial.print("C"); Serial.print(c);
-      Serial.print("  UID: "); Serial.println(startTag);
-    } else {
-      Serial.print("Start UID "); Serial.print(startTag);
-      Serial.println(" — not in grid map (set pose manually with 'pose R#C# N')");
-    }
-  } else {
-    Serial.println("No start tag detected.");
-  }
-
-  if (!poseKnown) {
-    // No RFID at start and no serial pose set — use hardcoded fallback so the
-    // start button always works without a laptop connected.
-    currentRow = FALLBACK_START_ROW;
-    currentCol = FALLBACK_START_COL;
-    currentFacing = F_NORTH;
-    poseKnown = true;
-    Serial.print("No start RFID — using fallback pose R");
-    Serial.print(FALLBACK_START_ROW); Serial.print("C");
-    Serial.print(FALLBACK_START_COL); Serial.println(" N");
-  }
+  // Fixed Task 4 assumes the robot is physically placed facing north.
+  currentFacing = F_NORTH;
 
   sysState       = SYS_BUSY;
   abortRequested = false;
@@ -837,8 +551,7 @@ void runFixedPath() {
   if (ok && !turnToFacing(F_NORTH)) ok = false;
   for (int i = 0; i < FIXED_NORTH_1 && ok; i++) {
     if (abortRequested || millis() - pathStartMs > PATH_TIMEOUT_MS) { ok = false; break; }
-    uint8_t er, ec; nextExpectedCell(er, ec);
-    if (!driveOneHop(er, ec)) { ok = false; break; }
+    if (!driveOneHop()) { ok = false; break; }
     delay(200);
   }
 
@@ -847,26 +560,26 @@ void runFixedPath() {
     Facing sideFacing = FIXED_TURN_RIGHT ? F_EAST : F_WEST;
     Serial.print("--- SEG 2: ");
     Serial.print(FIXED_TURN_RIGHT ? "East" : "West"); Serial.println(" ---");
+    Serial.println("  pre-turn align");
+    driveStraight(PRE_TURN_CM);
     if (!turnToFacing(sideFacing)) ok = false;
-    if (ok) { Serial.println("  post-turn align"); driveStraight(POST_TURN_CM); }
   }
   for (int i = 0; i < FIXED_EAST_NODES && ok; i++) {
     if (abortRequested || millis() - pathStartMs > PATH_TIMEOUT_MS) { ok = false; break; }
-    uint8_t er, ec; nextExpectedCell(er, ec);
-    if (!driveOneHop(er, ec)) { ok = false; break; }
+    if (!driveOneHop()) { ok = false; break; }
     delay(200);
   }
 
   // ---- Segment 3: face NORTH, drive FIXED_NORTH_2 nodes -------------------
   if (ok) {
     Serial.println("--- SEG 3: North ---");
+    Serial.println("  pre-turn align");
+    driveStraight(PRE_TURN_CM);
     if (!turnToFacing(F_NORTH)) ok = false;
-    if (ok) { Serial.println("  post-turn align"); driveStraight(POST_TURN_CM); }
   }
   for (int i = 0; i < FIXED_NORTH_2 && ok; i++) {
     if (abortRequested || millis() - pathStartMs > PATH_TIMEOUT_MS) { ok = false; break; }
-    uint8_t er, ec; nextExpectedCell(er, ec);
-    if (!driveOneHop(er, ec)) { ok = false; break; }
+    if (!driveOneHop()) { ok = false; break; }
     delay(200);
   }
 
@@ -883,7 +596,6 @@ void runFixedPath() {
   } else {
     Serial.println(">>> FIXED PATH FAILED <<<");
   }
-  printPose("Final pose: ");
 }
 
 // ===========================================================================
@@ -899,62 +611,24 @@ void runSingleHop() {
   Serial.println();
   Serial.println("=== Single hop ===");
 
-  // Capture starting tag
-  String startTag = captureTagBriefly();
-  latestRfidUid = startTag;
-  uint8_t sr = 0, sc = 0;
-  bool startKnown = false;
-  if (startTag.length() > 0) {
-    startKnown = lookupUid(startTag, sr, sc);
-    if (startKnown) {
-      currentRow = sr; currentCol = sc; poseKnown = true;
-      Serial.print("Start: R"); Serial.print(sr); Serial.print("C"); Serial.println(sc);
-    } else {
-      Serial.print("Start UID "); Serial.print(startTag); Serial.println(" (not in map)");
-    }
-  } else {
-    Serial.println("No start tag detected.");
-  }
-
   if (imuPresent) calibrateGyroBias();
 
-  // Do one hop in whatever direction the robot is facing
-  uint8_t er = currentRow, ec = currentCol;
-  int dr, dc; facingDelta(currentFacing, dr, dc);
-  er = (uint8_t)constrain((int)currentRow + dr, 1, 9);
-  ec = (uint8_t)constrain((int)currentCol + dc, 1, 9);
-  bool ok = driveOneHop(er, ec);
+  bool ok = driveOneHop();
 
   digitalWrite(LED_RED, HIGH); digitalWrite(LED_GREEN, LOW);
   sysState = SYS_IDLE;
   Serial.println(ok ? ">>> HOP SUCCESS <<<" : ">>> HOP FAILED <<<");
-  printPose("Final pose: ");
 }
 
 // ===========================================================================
 //  Telemetry
 // ===========================================================================
 
-void printPose(const char *prefix) {
-  if (prefix) Serial.print(prefix);
-  if (poseKnown) {
-    Serial.print("R"); Serial.print(currentRow); Serial.print("C"); Serial.print(currentCol);
-    Serial.print(" facing "); Serial.println(FACING_NAME[currentFacing]);
-  } else {
-    Serial.println("(unknown)");
-  }
-}
-
 void dumpStatus(const char *prefix) {
   long lf, lb, rf, rb; readEncoders(lf, lb, rf, rb);
   float distCm = ((lf + lb + rf + rb) / 4.0f) * MM_PER_COUNT / 10.0f;
   if (prefix) Serial.print(prefix);
-  Serial.print("pose=");
-  if (poseKnown) {
-    Serial.print("R"); Serial.print(currentRow); Serial.print("C"); Serial.print(currentCol);
-    Serial.print(FACING_NAME[currentFacing]);
-  } else Serial.print("?");
-  Serial.print("  ENC LF="); Serial.print(lf);
+  Serial.print("ENC LF="); Serial.print(lf);
   Serial.print(" LB="); Serial.print(lb);
   Serial.print(" RF="); Serial.print(rf);
   Serial.print(" RB="); Serial.print(rb);
@@ -963,7 +637,7 @@ void dumpStatus(const char *prefix) {
   Serial.print("  US F="); Serial.print(readDistance(FRONT_TRIG, FRONT_ECHO), 1);
   Serial.print(" L="); Serial.print(readDistance(LEFT_TRIG, LEFT_ECHO), 1);
   Serial.print(" R="); Serial.print(readDistance(RIGHT_TRIG, RIGHT_ECHO), 1);
-  Serial.print("  RFID="); Serial.println(latestRfidUid.length() ? latestRfidUid : "(none)");
+  Serial.print("  RFID_now="); Serial.println(readRfidPresent() ? "detected" : "none");
 }
 
 void dumpImu() {
@@ -999,86 +673,10 @@ void processCommand(String cmd) {
       else Serial.println("IMU not present.");
     }
     else if (c == 'r' || c == 'R') {
-      String u = readRfidUid();
-      if (u.length() == 0) Serial.println("RFID: (none)");
-      else {
-        uint8_t r, col; bool known = lookupUid(u, r, col);
-        Serial.print("RFID: "); Serial.print(u);
-        if (known) { Serial.print(" -> R"); Serial.print(r); Serial.print("C"); Serial.println(col); }
-        else Serial.println(" (not in grid)");
-      }
+      Serial.println(readRfidPresent() ? "RFID: detected" : "RFID: none");
     }
     else if (c == 'z' || c == 'Z') { resetEncoders(); Serial.println("Encoders zeroed."); }
     else Serial.print("?cmd: "); Serial.println(cmd);
-    return;
-  }
-
-  String upper = cmd; upper.toUpperCase();
-
-  // face N|E|S|W
-  if (upper.startsWith("FACE ")) {
-    Facing f;
-    if (cmd.length() >= 6 && parseFacingChar(cmd.charAt(5), f)) {
-      currentFacing = f; poseKnown = (currentRow != 0 && currentCol != 0);
-      Serial.print("Facing set to "); Serial.println(FACING_NAME[currentFacing]);
-      printPose("Pose: ");
-    } else Serial.println("usage: face N|E|S|W");
-    return;
-  }
-
-  // at R#C#
-  if (upper.startsWith("AT ")) {
-    uint8_t r, c;
-    if (parseCell(cmd.substring(3), r, c)) {
-      currentRow = r; currentCol = c; poseKnown = true;
-      Serial.print("Cell set to R"); Serial.print(r); Serial.print("C"); Serial.println(c);
-      printPose("Pose: ");
-    } else Serial.println("usage: at R#C#");
-    return;
-  }
-
-  // pose R#C# F
-  if (upper.startsWith("POSE ")) {
-    String rest = cmd.substring(5); rest.trim();
-    int sp = rest.indexOf(' ');
-    if (sp <= 0) { Serial.println("usage: pose R#C# N|E|S|W"); return; }
-    uint8_t r, c; Facing f;
-    if (parseCell(rest.substring(0, sp), r, c) && parseFacingChar(rest.charAt(sp+1), f)) {
-      currentRow = r; currentCol = c; currentFacing = f; poseKnown = true;
-      printPose("Pose: ");
-    } else Serial.println("usage: pose R#C# N|E|S|W");
-    return;
-  }
-
-  // go R#C#
-  if (upper.startsWith("GO ")) {
-    uint8_t r, c;
-    if (parseCell(cmd.substring(3), r, c)) planAndExecute(r, c);
-    else Serial.println("usage: go R#C#");
-    return;
-  }
-
-  // path R#C# R#C# [F]
-  if (upper.startsWith("PATH ")) {
-    String rest = cmd.substring(5); rest.trim();
-    int sp1 = rest.indexOf(' ');
-    if (sp1 <= 0) { Serial.println("usage: path R#C# R#C# [N|E|S|W]"); return; }
-    String fromS = rest.substring(0, sp1);
-    String tail = rest.substring(sp1+1); tail.trim();
-    int sp2 = tail.indexOf(' ');
-    String toS;
-    char fch = 'N';
-    if (sp2 > 0) { toS = tail.substring(0, sp2); fch = tail.charAt(sp2+1); }
-    else         { toS = tail; }
-    uint8_t fr, fc, tr, tc; Facing f = currentFacing;
-    if (!parseCell(fromS, fr, fc) || !parseCell(toS, tr, tc)) {
-      Serial.println("usage: path R#C# R#C# [N|E|S|W]"); return;
-    }
-    if (sp2 > 0) parseFacingChar(fch, f);
-    currentRow = fr; currentCol = fc; currentFacing = f; poseKnown = true;
-    Serial.print("Pose set: R"); Serial.print(fr); Serial.print("C"); Serial.print(fc);
-    Serial.print(" facing "); Serial.println(FACING_NAME[f]);
-    planAndExecute(tr, tc);
     return;
   }
 
@@ -1134,8 +732,8 @@ void setup() {
   while (!Serial && millis() - sw < 2000) {}
 
   Serial.println();
-  Serial.println("=== Task 4: dead reckoning + pathfinding ===");
-  Serial.print("Grid: "); Serial.print(GRID_SIZE); Serial.println(" cells");
+  Serial.println("=== Task 4: fixed path + RFID presence ===");
+  Serial.println("RFID mode: presence only");
   Serial.print("MM/count: "); Serial.println(MM_PER_COUNT, 4);
   Serial.print("25 cm = "); Serial.print(TARGET_COUNTS); Serial.print(" counts (max ");
   Serial.print(MAX_COUNTS); Serial.println(")");
@@ -1195,12 +793,7 @@ void setup() {
   Serial.println("  m                       FIXED PATH mission (Fig 1 staircase) <-- Task 4");
   Serial.println("  g                       single 25 cm hop (debug)");
   Serial.println("  s                       abort current motion");
-  Serial.println("  pose R#C# N|E|S|W       set full pose before 'm' if no start RFID");
-  Serial.println("  face N|E|S|W            set facing only");
-  Serial.println("  at R#C#                 set cell only");
-  Serial.println("  go R#C#                 free-form pathfind to R#C#");
-  Serial.println("  path R#C# R#C# [F]      set pose, then pathfind");
-  Serial.println("  d / r / i / c / z       dump / RFID read / IMU / recal / zero enc");
+  Serial.println("  d / r / i / c / z       dump / RFID presence / IMU / recal / zero enc");
   Serial.print  ("  Fixed path: North x"); Serial.print(FIXED_NORTH_1);
   Serial.print  (" -> "); Serial.print(FIXED_TURN_RIGHT ? "East" : "West");
   Serial.print  (" x"); Serial.print(FIXED_EAST_NODES);
