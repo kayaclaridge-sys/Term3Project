@@ -42,7 +42,7 @@ const float TOUCH_ZONE_CM = 12.0;
 // Motor commands are intentionally conservative to avoid a hard hit.
 const int CRUISE_COMMAND = 260;
 const int START_BOOST_COMMAND = 320;
-const int CREEP_COMMAND = 125;
+const int CREEP_COMMAND = 140;
 const int TOUCH_COMMAND = 110;
 const int NO_DISTANCE_COMMAND = 130;
 
