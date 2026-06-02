@@ -52,8 +52,8 @@ const int MAX_SPEED = 650;
 const int MAX_TURN = 650;
 const int SEARCH_SPEED = 220;
 
-const int TURN_SPEED = 550;
-const int TURN_BOOST_SPEED = 550;
+const int TURN_SPEED = 600;
+const int TURN_BOOST_SPEED = 600;
 const int PRE_TURN_SPEED = 600;
 const int BRIDGE_SPEED = 600;
 
