@@ -80,6 +80,7 @@ const int INITIAL_SEED_COUNT = 5;
 const int MAX_SEED_COUNT = 5;
 const int MANUAL_SEED_STEP_DEGREES = 60;
 const bool MANUAL_CLOCKWISE_IS_INCREASING = true;
+const bool TASK3_AUTO_DROP_CLOCKWISE = true;
 
 const unsigned long GATE_OPEN_MS = 450;
 const unsigned long GATE_CLOSE_SETTLE_MS = 250;
@@ -275,6 +276,8 @@ bool isSeedDropperBusy();
 bool handlePlantCommand(const String &lower);
 void printTask3PlantingStatus();
 void resetTask3PlantingMemory();
+bool runTask3ServoDropAtPendingPoint();
+void completeTask3PlantingDrop();
 
 // =====================================================
 // QTR reading and calibration
@@ -605,6 +608,14 @@ bool resetDropperToZeroBlocking() {
   return moveDropperToAngleBlocking(0);
 }
 
+bool rotateTask3AutoDropStepBlocking() {
+  if (TASK3_AUTO_DROP_CLOCKWISE) {
+    return rotateDropperClockwise60Blocking();
+  }
+
+  return rotateDropperCounterClockwise60Blocking();
+}
+
 bool isSeedDropperBusy() {
   return dropperState != DROPPER_IDLE;
 }
@@ -632,8 +643,8 @@ const char *dropperStateName() {
 
 void setupSeedDropper() {
   seedServo.attach(SEED_SERVO_PIN, SERVO_MIN_US, SERVO_MAX_US);
-  setDropperAngle(GATE_CLOSED_DEGREES);
-  targetDropperAngle = GATE_CLOSED_DEGREES;
+  setDropperAngle(0);
+  targetDropperAngle = 0;
 }
 
 bool startSeedDrop() {
@@ -740,13 +751,8 @@ bool handlePlantCommand(const String &lower) {
     }
 
     if (task3WaitingForSeed && seedsRemaining > 0 && task3PendingPlantValid) {
-      Serial.println("Task3 manual seed loaded. Resuming seed drop.");
-
-      if (startSeedDrop()) {
-        enterState(STATE_PLANT_DROP);
-      } else {
-        Serial.println("Task3 still waiting for seed load.");
-      }
+      Serial.println("Task3 manual seed loaded. Resuming 60-degree seed drop.");
+      runTask3ServoDropAtPendingPoint();
     }
 
     return true;
@@ -781,9 +787,9 @@ bool handlePlantCommand(const String &lower) {
       Serial.println("Plant reset ignored: dropper is busy.");
     } else {
       seedsRemaining = INITIAL_SEED_COUNT;
-      setDropperAngle(GATE_CLOSED_DEGREES);
-      targetDropperAngle = GATE_CLOSED_DEGREES;
-      Serial.println("Plant seed count reset and gate closed.");
+      setDropperAngle(0);
+      targetDropperAngle = 0;
+      Serial.println("Plant seed count reset and servo zeroed.");
     }
     return true;
   }
@@ -1742,6 +1748,35 @@ void startTask3PlantAtCurrentPoint() {
   enterState(STATE_PLANT_RFID_PAUSE);
 }
 
+bool runTask3ServoDropAtPendingPoint() {
+  if (!task3PendingPlantValid || !isValidGridPoint(task3PendingPlantPoint)) {
+    Serial.println("Task3 60-degree drop ignored: no pending planting point.");
+    return false;
+  }
+
+  if (isSeedDropperBusy()) {
+    Serial.println("Task3 60-degree drop ignored: dropper is busy.");
+    return false;
+  }
+
+  if (seedsRemaining <= 0) {
+    Serial.println("Task3 60-degree drop ignored: no seeds remaining.");
+    return false;
+  }
+
+  if (!rotateTask3AutoDropStepBlocking()) {
+    Serial.println("Task3 60-degree drop failed: servo did not move.");
+    return false;
+  }
+
+  seedsRemaining--;
+  Serial.print("Task3 60-degree seed dropped. Remaining: ");
+  Serial.println(seedsRemaining);
+
+  completeTask3PlantingDrop();
+  return true;
+}
+
 void completeTask3PlantingDrop() {
   if (task3PendingPlantValid && isValidGridPoint(task3PendingPlantPoint)) {
     task3Planted[task3PendingPlantPoint.row][task3PendingPlantPoint.col] = true;
@@ -2126,10 +2161,10 @@ void updateStateMachine() {
       if (seedsRemaining <= 0) {
         Serial.println("Task3 out of seeds. Load one seed, then send: plant load");
         enterState(STATE_WAIT_FOR_SEED_LOAD);
-      } else if (startSeedDrop()) {
-        enterState(STATE_PLANT_DROP);
+      } else if (runTask3ServoDropAtPendingPoint()) {
+        // runTask3ServoDropAtPendingPoint marks the cell and continues navigation.
       } else {
-        Serial.println("Task3 seed drop could not start. Waiting for manual seed load.");
+        Serial.println("Task3 60-degree seed drop could not run. Waiting for manual seed load.");
         enterState(STATE_WAIT_FOR_SEED_LOAD);
       }
     }
@@ -2477,8 +2512,24 @@ void handleSerialCommands() {
     char input = Serial.read();
 
     if (input == '\r' || input == '\n') {
-      processSerialCommand(serialLine);
+      if (serialLine.length() > 0) {
+        processSerialCommand(serialLine);
+      }
       serialLine = "";
+    } else if (serialLine.length() == 0 &&
+               (input == 'g' || input == 'G' ||
+                input == 'o' || input == 'O' ||
+                input == 's' || input == 'S' ||
+                input == 'c' || input == 'C' ||
+                input == 'p' || input == 'P' ||
+                input == 'm' || input == 'M' ||
+                input == 'a' || input == 'A' ||
+                input == 'd' || input == 'D' ||
+                input == '1' || input == '2' ||
+                input == '?')) {
+      String immediateCommand = "";
+      immediateCommand += input;
+      processSerialCommand(immediateCommand);
     } else {
       serialLine += input;
       if (serialLine.length() > 64) {
