@@ -1,6 +1,7 @@
 #include <Wire.h>
 #include <Motoron.h>
 #include <MFRC522_I2C.h>
+#include <Servo.h>
 
 // =====================================================
 // Trial Run 2 - Task 3 RFID navigation
@@ -46,16 +47,16 @@ const uint8_t REAR_RIGHT_MOTOR = 2;
 const int LEFT_MOTOR_SIGN = 1;
 const int RIGHT_MOTOR_SIGN = -1;
 
-const int BASE_SPEED = 250;
-const int CURVE_BASE_SPEED = 250;
-const int MAX_SPEED = 650;
-const int MAX_TURN = 650;
-const int SEARCH_SPEED = 220;
+const int BASE_SPEED = 200;
+const int CURVE_BASE_SPEED = 200;
+const int MAX_SPEED = 600;
+const int MAX_TURN = 600;
+const int SEARCH_SPEED = 170;
 
-const int TURN_SPEED = 600;
-const int TURN_BOOST_SPEED = 600;
-const int PRE_TURN_SPEED = 600;
-const int BRIDGE_SPEED = 600;
+const int TURN_SPEED = 550;
+const int TURN_BOOST_SPEED = 550;
+const int PRE_TURN_SPEED = 550;
+const int BRIDGE_SPEED = 550;
 
 const float KP = 0.12;
 const float KD = 0.80;
@@ -64,9 +65,44 @@ int lastError = 0;
 
 // -------------------- Buttons and LEDs --------------------
 const int START_BUTTON_PIN = 32;
-const int STOP_BUTTON_PIN = 33;
+const int STOP_BUTTON_PIN = 53;
 const int LED_RED_PIN = 34;
 const int LED_GREEN_PIN = 35;
+
+// -------------------- Seed / plant dropper --------------------
+const byte SEED_SERVO_PIN = 47;
+const int SERVO_MIN_US = 500;
+const int SERVO_MAX_US = 2500;
+const int SERVO_RANGE_DEGREES = 300;
+const int GATE_CLOSED_DEGREES = 20;
+const int GATE_OPEN_DEGREES = 90;
+const int INITIAL_SEED_COUNT = 5;
+const int MAX_SEED_COUNT = 5;
+const int MANUAL_SEED_STEP_DEGREES = 60;
+const bool MANUAL_CLOCKWISE_IS_INCREASING = true;
+
+const unsigned long GATE_OPEN_MS = 450;
+const unsigned long GATE_CLOSE_SETTLE_MS = 250;
+const int MOVE_STEP_DEGREES = 2;
+const unsigned long MOVE_STEP_MS = 8;
+
+enum DropperState {
+  DROPPER_IDLE,
+  DROPPER_OPENING,
+  DROPPER_OPEN,
+  DROPPER_CLOSING,
+  DROPPER_WAIT_AFTER_CLOSE,
+  DROPPER_MANUAL_OPENING,
+  DROPPER_MANUAL_CLOSING
+};
+
+Servo seedServo;
+DropperState dropperState = DROPPER_IDLE;
+unsigned long dropperWaitStartedMs = 0;
+unsigned long lastDropperMoveStepMs = 0;
+int currentDropperAngle = GATE_CLOSED_DEGREES;
+int targetDropperAngle = GATE_CLOSED_DEGREES;
+int seedsRemaining = INITIAL_SEED_COUNT;
 
 // -------------------- RFID navigation map --------------------
 const byte RFID_I2C_ADDRESS = 0x28;
@@ -90,6 +126,13 @@ const char *const RFID_MAP[MAP_ROWS][MAP_COLS] = {
   {"7C88AB41", "2A60AB41", "E74BA941", "C47CAB41", "BCCFAA41", "07F6AA41", "3385AB41", "573DAB41", "F642AB41"},
   {"F07EAB41", "528AAB41", "375CAB41", "8145A941", "76F0AA41", "F63BAB41", "9017AB41", "390DAB41", "1F27AB41"}
 };
+
+const char *const TASK3_START_UID = "855AAB41";
+const char *const TASK3_EXIT_UID = "1B0AAB41";
+const uint8_t TASK3_NAV_ROWS = 4;
+const uint8_t TASK3_TARGET_SEEDS = 5;
+const int PLANT_FORWARD_SPEED = BASE_SPEED;
+const unsigned long PLANT_FORWARD_2CM_MS = 180;
 
 // -------------------- Turn and recovery tuning --------------------
 const unsigned long PRE_TURN_MS = 150;
@@ -124,6 +167,10 @@ enum RobotState {
   STATE_IDLE,
   STATE_FOLLOW_LINE,
   STATE_RFID_PAUSE,
+  STATE_PLANT_RFID_PAUSE,
+  STATE_PLANT_FORWARD,
+  STATE_PLANT_DROP,
+  STATE_WAIT_FOR_SEED_LOAD,
   STATE_PRE_TURN,
   STATE_TURN_LEFT,
   STATE_TURN_RIGHT,
@@ -138,6 +185,7 @@ enum TurnDirection {
 };
 
 enum NavigationMode {
+  NAV_MODE_TASK3_PLANTING,
   NAV_MODE_TASK3_FIXED,
   NAV_MODE_AUTO_ROUTE
 };
@@ -173,7 +221,7 @@ struct GridPoint {
 
 RobotState robotState = STATE_IDLE;
 TurnDirection pendingTurn = TURN_NONE;
-NavigationMode selectedNavMode = NAV_MODE_TASK3_FIXED;
+NavigationMode selectedNavMode = NAV_MODE_TASK3_PLANTING;
 Heading currentHeading = HEADING_EAST;
 Heading configuredStartHeading = HEADING_EAST;
 RouteAction pendingPausedAction = ROUTE_ACTION_IGNORE;
@@ -185,6 +233,16 @@ GridPoint activeRoute[MAX_ROUTE_POINTS];
 uint8_t activeRouteLength = 0;
 uint8_t activeRouteIndex = 0;
 uint8_t fixedActionIndex = 0;
+
+bool task3Planted[MAP_ROWS][MAP_COLS];
+uint8_t task3SeedsPlanted = 0;
+bool task3ReturningToExit = false;
+bool task3MissionComplete = false;
+bool task3CurrentPointValid = false;
+bool task3PendingPlantValid = false;
+GridPoint task3CurrentPoint = {-1, -1};
+GridPoint task3PendingPlantPoint = {-1, -1};
+GridPoint task3RouteGoal = {-1, -1};
 
 String autoStartUid = "";
 String autoGoalUid = "";
@@ -204,9 +262,19 @@ uint8_t rightAngleFrames = 0;
 uint8_t hollowCrossFrames = 0;
 
 void stopDrive();
+void stopRobot();
 void printHelp();
 void printSnapshot(const LineSnapshot &snapshot);
+void printActiveRoute();
 void enterState(RobotState newState);
+void performRouteAction(RouteAction action);
+void executeRouteAction(RouteAction action);
+void setupSeedDropper();
+void updateSeedDropper();
+bool isSeedDropperBusy();
+bool handlePlantCommand(const String &lower);
+void printTask3PlantingStatus();
+void resetTask3PlantingMemory();
 
 // =====================================================
 // QTR reading and calibration
@@ -445,6 +513,339 @@ void stopDrive() {
 }
 
 // =====================================================
+// Seed / plant dropper
+// =====================================================
+
+int dropperAngleToPulse(int angle) {
+  angle = constrain(angle, 0, SERVO_RANGE_DEGREES);
+  long pulse = SERVO_MIN_US +
+               (long)(SERVO_MAX_US - SERVO_MIN_US) * angle / SERVO_RANGE_DEGREES;
+  return (int)pulse;
+}
+
+void setDropperAngle(int angle) {
+  currentDropperAngle = constrain(angle, 0, SERVO_RANGE_DEGREES);
+  seedServo.writeMicroseconds(dropperAngleToPulse(currentDropperAngle));
+}
+
+void startDropperMove(int angle) {
+  targetDropperAngle = constrain(angle, 0, SERVO_RANGE_DEGREES);
+  lastDropperMoveStepMs = millis();
+}
+
+bool updateDropperMove() {
+  if (currentDropperAngle == targetDropperAngle) {
+    return true;
+  }
+
+  unsigned long nowMs = millis();
+  if (nowMs - lastDropperMoveStepMs < MOVE_STEP_MS) {
+    return false;
+  }
+
+  lastDropperMoveStepMs = nowMs;
+
+  if (targetDropperAngle > currentDropperAngle) {
+    setDropperAngle(min(currentDropperAngle + MOVE_STEP_DEGREES, targetDropperAngle));
+  } else {
+    setDropperAngle(max(currentDropperAngle - MOVE_STEP_DEGREES, targetDropperAngle));
+  }
+
+  return currentDropperAngle == targetDropperAngle;
+}
+
+bool moveDropperToAngleBlocking(int targetAngle) {
+  targetAngle = constrain(targetAngle, 0, SERVO_RANGE_DEGREES);
+
+  if (targetAngle == currentDropperAngle) {
+    Serial.print("Plant servo already at ");
+    Serial.print(currentDropperAngle);
+    Serial.println(" degrees.");
+    targetDropperAngle = currentDropperAngle;
+    return false;
+  }
+
+  if (targetAngle > currentDropperAngle) {
+    for (int angle = currentDropperAngle; angle <= targetAngle; angle += MOVE_STEP_DEGREES) {
+      setDropperAngle(angle);
+      delay(MOVE_STEP_MS);
+    }
+  } else {
+    for (int angle = currentDropperAngle; angle >= targetAngle; angle -= MOVE_STEP_DEGREES) {
+      setDropperAngle(angle);
+      delay(MOVE_STEP_MS);
+    }
+  }
+
+  setDropperAngle(targetAngle);
+  targetDropperAngle = targetAngle;
+
+  Serial.print("Plant servo angle: ");
+  Serial.print(currentDropperAngle);
+  Serial.println(" degrees.");
+  delay(100);
+  return true;
+}
+
+bool rotateDropperClockwise60Blocking() {
+  int targetAngle = MANUAL_CLOCKWISE_IS_INCREASING
+                    ? currentDropperAngle + MANUAL_SEED_STEP_DEGREES
+                    : currentDropperAngle - MANUAL_SEED_STEP_DEGREES;
+  return moveDropperToAngleBlocking(targetAngle);
+}
+
+bool rotateDropperCounterClockwise60Blocking() {
+  int targetAngle = MANUAL_CLOCKWISE_IS_INCREASING
+                    ? currentDropperAngle - MANUAL_SEED_STEP_DEGREES
+                    : currentDropperAngle + MANUAL_SEED_STEP_DEGREES;
+  return moveDropperToAngleBlocking(targetAngle);
+}
+
+bool resetDropperToZeroBlocking() {
+  return moveDropperToAngleBlocking(0);
+}
+
+bool isSeedDropperBusy() {
+  return dropperState != DROPPER_IDLE;
+}
+
+const char *dropperStateName() {
+  switch (dropperState) {
+    case DROPPER_IDLE:
+      return "IDLE";
+    case DROPPER_OPENING:
+      return "OPENING";
+    case DROPPER_OPEN:
+      return "OPEN";
+    case DROPPER_CLOSING:
+      return "CLOSING";
+    case DROPPER_WAIT_AFTER_CLOSE:
+      return "WAIT_AFTER_CLOSE";
+    case DROPPER_MANUAL_OPENING:
+      return "MANUAL_OPENING";
+    case DROPPER_MANUAL_CLOSING:
+      return "MANUAL_CLOSING";
+  }
+
+  return "?";
+}
+
+void setupSeedDropper() {
+  seedServo.attach(SEED_SERVO_PIN, SERVO_MIN_US, SERVO_MAX_US);
+  setDropperAngle(GATE_CLOSED_DEGREES);
+  targetDropperAngle = GATE_CLOSED_DEGREES;
+}
+
+bool startSeedDrop() {
+  if (isSeedDropperBusy()) {
+    Serial.println("Plant drop ignored: dropper is busy.");
+    return false;
+  }
+
+  if (seedsRemaining <= 0) {
+    Serial.println("Plant drop ignored: no seeds remaining.");
+    return false;
+  }
+
+  startDropperMove(GATE_OPEN_DEGREES);
+  dropperState = DROPPER_OPENING;
+  Serial.println("Plant seed drop started.");
+  return true;
+}
+
+void updateSeedDropper() {
+  if (dropperState == DROPPER_IDLE) {
+    return;
+  }
+
+  unsigned long elapsedMs = millis() - dropperWaitStartedMs;
+
+  if (dropperState == DROPPER_OPENING && updateDropperMove()) {
+    dropperState = DROPPER_OPEN;
+    dropperWaitStartedMs = millis();
+  } else if (dropperState == DROPPER_OPEN && elapsedMs >= GATE_OPEN_MS) {
+    startDropperMove(GATE_CLOSED_DEGREES);
+    dropperState = DROPPER_CLOSING;
+  } else if (dropperState == DROPPER_CLOSING && updateDropperMove()) {
+    dropperState = DROPPER_WAIT_AFTER_CLOSE;
+    dropperWaitStartedMs = millis();
+  } else if (dropperState == DROPPER_WAIT_AFTER_CLOSE && elapsedMs >= GATE_CLOSE_SETTLE_MS) {
+    seedsRemaining--;
+    dropperState = DROPPER_IDLE;
+
+    Serial.print("Plant seed dropped. Remaining: ");
+    Serial.println(seedsRemaining);
+  } else if (dropperState == DROPPER_MANUAL_OPENING && updateDropperMove()) {
+    dropperState = DROPPER_IDLE;
+    Serial.println("Plant gate manual open complete.");
+  } else if (dropperState == DROPPER_MANUAL_CLOSING && updateDropperMove()) {
+    dropperState = DROPPER_IDLE;
+    Serial.println("Plant gate manual close complete.");
+  }
+}
+
+void printSeedDropperStatus() {
+  Serial.print("Plant seeds=");
+  Serial.print(seedsRemaining);
+  Serial.print("/");
+  Serial.print(MAX_SEED_COUNT);
+  Serial.print(" state=");
+  Serial.print(dropperStateName());
+  Serial.print(" angle=");
+  Serial.print(currentDropperAngle);
+  Serial.print(" target=");
+  Serial.println(targetDropperAngle);
+}
+
+bool requireIdleForPlantCommand() {
+  if (robotState != STATE_IDLE) {
+    Serial.println("Stop Task 3 before manual plant/dropper control.");
+    return false;
+  }
+
+  return true;
+}
+
+bool handlePlantCommand(const String &lower) {
+  if (lower == "plant status") {
+    printSeedDropperStatus();
+    return true;
+  }
+
+  bool isLoadCommand = lower == "plant load" || lower == "load" || lower == "seed load";
+  bool isManualDropCommand = lower == "plant drop" || lower == "drop" || lower == "seed drop";
+
+  if (!isLoadCommand && !isManualDropCommand && !lower.startsWith("plant ")) {
+    return false;
+  }
+
+  if (isLoadCommand) {
+    bool task3WaitingForSeed = selectedNavMode == NAV_MODE_TASK3_PLANTING &&
+                               robotState == STATE_WAIT_FOR_SEED_LOAD;
+
+    if (!task3WaitingForSeed && !requireIdleForPlantCommand()) {
+      return true;
+    }
+
+    if (isSeedDropperBusy()) {
+      Serial.println("Plant load ignored: dropper is busy.");
+    } else if (seedsRemaining >= MAX_SEED_COUNT) {
+      Serial.println("Plant seed count already full.");
+    } else if (rotateDropperClockwise60Blocking()) {
+      seedsRemaining++;
+      Serial.print("Plant seed loaded. Remaining: ");
+      Serial.println(seedsRemaining);
+    } else {
+      Serial.println("Plant load did not move the servo; seed count unchanged.");
+    }
+
+    if (task3WaitingForSeed && seedsRemaining > 0 && task3PendingPlantValid) {
+      Serial.println("Task3 manual seed loaded. Resuming seed drop.");
+
+      if (startSeedDrop()) {
+        enterState(STATE_PLANT_DROP);
+      } else {
+        Serial.println("Task3 still waiting for seed load.");
+      }
+    }
+
+    return true;
+  }
+
+  if (isManualDropCommand) {
+    if (!requireIdleForPlantCommand()) {
+      return true;
+    }
+
+    if (isSeedDropperBusy()) {
+      Serial.println("Plant manual drop ignored: dropper is busy.");
+    } else if (seedsRemaining <= 0) {
+      Serial.println("Plant manual drop ignored: no seeds remaining.");
+    } else if (rotateDropperCounterClockwise60Blocking()) {
+      seedsRemaining--;
+      Serial.print("Plant seed manually dropped. Remaining: ");
+      Serial.println(seedsRemaining);
+    } else {
+      Serial.println("Plant manual drop did not move the servo; seed count unchanged.");
+    }
+
+    return true;
+  }
+
+  if (lower == "plant reset") {
+    if (!requireIdleForPlantCommand()) {
+      return true;
+    }
+
+    if (isSeedDropperBusy()) {
+      Serial.println("Plant reset ignored: dropper is busy.");
+    } else {
+      seedsRemaining = INITIAL_SEED_COUNT;
+      setDropperAngle(GATE_CLOSED_DEGREES);
+      targetDropperAngle = GATE_CLOSED_DEGREES;
+      Serial.println("Plant seed count reset and gate closed.");
+    }
+    return true;
+  }
+
+  if (lower == "plant zero" || lower == "plant servo reset" || lower == "plant reset servo") {
+    if (!requireIdleForPlantCommand()) {
+      return true;
+    }
+
+    if (isSeedDropperBusy()) {
+      Serial.println("Plant servo reset ignored: dropper is busy.");
+    } else {
+      resetDropperToZeroBlocking();
+    }
+    return true;
+  }
+
+  if (lower == "plant open") {
+    if (!requireIdleForPlantCommand()) {
+      return true;
+    }
+
+    if (isSeedDropperBusy()) {
+      Serial.println("Plant open ignored: dropper is busy.");
+    } else {
+      startDropperMove(GATE_OPEN_DEGREES);
+      dropperState = DROPPER_MANUAL_OPENING;
+      Serial.println("Plant gate manual open started.");
+    }
+    return true;
+  }
+
+  if (lower == "plant close") {
+    if (!requireIdleForPlantCommand()) {
+      return true;
+    }
+
+    if (dropperState != DROPPER_IDLE && dropperState != DROPPER_MANUAL_OPENING) {
+      Serial.println("Plant close ignored: automatic drop is active.");
+    } else {
+      startDropperMove(GATE_CLOSED_DEGREES);
+      dropperState = DROPPER_MANUAL_CLOSING;
+      Serial.println("Plant gate manual close started.");
+    }
+    return true;
+  }
+
+  if (lower == "plant auto drop") {
+    if (!requireIdleForPlantCommand()) {
+      return true;
+    }
+
+    stopDrive();
+    startSeedDrop();
+    return true;
+  }
+
+  Serial.println("Unknown plant command. Use load/drop/plant auto drop/plant reset/plant zero/plant open/plant close/plant status.");
+  return true;
+}
+
+// =====================================================
 // Detection and state machine
 // =====================================================
 
@@ -456,6 +857,14 @@ const char *stateName(RobotState state) {
       return "FOLLOW_LINE";
     case STATE_RFID_PAUSE:
       return "RFID_PAUSE";
+    case STATE_PLANT_RFID_PAUSE:
+      return "PLANT_RFID_PAUSE";
+    case STATE_PLANT_FORWARD:
+      return "PLANT_FORWARD";
+    case STATE_PLANT_DROP:
+      return "PLANT_DROP";
+    case STATE_WAIT_FOR_SEED_LOAD:
+      return "WAIT_FOR_SEED_LOAD";
     case STATE_PRE_TURN:
       return "PRE_TURN";
     case STATE_TURN_LEFT:
@@ -504,7 +913,16 @@ void incrementOrReset(uint8_t &counter, bool condition) {
 }
 
 const char *navigationModeName(NavigationMode mode) {
-  return mode == NAV_MODE_TASK3_FIXED ? "TASK3_FIXED" : "AUTO_ROUTE";
+  switch (mode) {
+    case NAV_MODE_TASK3_PLANTING:
+      return "TASK3_PLANTING";
+    case NAV_MODE_TASK3_FIXED:
+      return "TASK3_FIXED";
+    case NAV_MODE_AUTO_ROUTE:
+      return "AUTO_ROUTE";
+  }
+
+  return "?";
 }
 
 const char *headingName(Heading heading) {
@@ -758,6 +1176,596 @@ RouteAction actionFromHeading(Heading from, Heading to) {
   return ROUTE_ACTION_UNSUPPORTED;
 }
 
+Heading leftOfHeading(Heading heading) {
+  return (Heading)(((int)heading + 3) % 4);
+}
+
+Heading rightOfHeading(Heading heading) {
+  return (Heading)(((int)heading + 1) % 4);
+}
+
+void headingDelta(Heading heading, int8_t &rowDelta, int8_t &colDelta) {
+  rowDelta = 0;
+  colDelta = 0;
+
+  if (heading == HEADING_NORTH) {
+    rowDelta = -1;
+  } else if (heading == HEADING_EAST) {
+    colDelta = 1;
+  } else if (heading == HEADING_SOUTH) {
+    rowDelta = 1;
+  } else if (heading == HEADING_WEST) {
+    colDelta = -1;
+  }
+}
+
+bool isValidGridPoint(GridPoint point) {
+  return point.row >= 0 && point.row < MAP_ROWS && point.col >= 0 && point.col < MAP_COLS;
+}
+
+bool gridPointUidEquals(GridPoint point, const char *uid) {
+  if (!isValidGridPoint(point)) {
+    return false;
+  }
+
+  return String(RFID_MAP[point.row][point.col]) == uid;
+}
+
+bool isTask3StartPoint(GridPoint point) {
+  return gridPointUidEquals(point, TASK3_START_UID);
+}
+
+bool isTask3ExitPoint(GridPoint point) {
+  return gridPointUidEquals(point, TASK3_EXIT_UID);
+}
+
+bool isTask3Endpoint(GridPoint point) {
+  return isTask3StartPoint(point) || isTask3ExitPoint(point);
+}
+
+bool isTask3PlantableCell(GridPoint point) {
+  return isValidGridPoint(point) &&
+         point.row < TASK3_NAV_ROWS &&
+         !isTask3Endpoint(point);
+}
+
+bool isTask3CellPlanted(GridPoint point) {
+  if (!isValidGridPoint(point)) {
+    return false;
+  }
+
+  return task3Planted[point.row][point.col];
+}
+
+void setInvalidPoint(GridPoint &point) {
+  point.row = -1;
+  point.col = -1;
+}
+
+void resetTask3PlantingMemory() {
+  for (uint8_t row = 0; row < MAP_ROWS; row++) {
+    for (uint8_t col = 0; col < MAP_COLS; col++) {
+      task3Planted[row][col] = false;
+    }
+  }
+
+  task3SeedsPlanted = 0;
+  task3ReturningToExit = false;
+  task3MissionComplete = false;
+  task3CurrentPointValid = false;
+  task3PendingPlantValid = false;
+  setInvalidPoint(task3CurrentPoint);
+  setInvalidPoint(task3PendingPlantPoint);
+  setInvalidPoint(task3RouteGoal);
+  activeRouteLength = 0;
+  activeRouteIndex = 0;
+
+  GridPoint startPoint;
+  if (findUidInMap(String(TASK3_START_UID), startPoint)) {
+    task3CurrentPoint = startPoint;
+    task3CurrentPointValid = true;
+  }
+
+  Serial.println("Task 3 planting memory reset.");
+}
+
+void printGridPoint(const char *label, GridPoint point) {
+  Serial.print(label);
+
+  if (!isValidGridPoint(point)) {
+    Serial.println("(unknown)");
+    return;
+  }
+
+  Serial.print("r");
+  Serial.print(point.row + 1);
+  Serial.print(" c");
+  Serial.print(point.col + 1);
+  Serial.print(" ");
+  Serial.println(uidAtPoint(point));
+}
+
+void printTask3PlantingStatus() {
+  Serial.print("Task3 planted=");
+  Serial.print(task3SeedsPlanted);
+  Serial.print("/");
+  Serial.print(TASK3_TARGET_SEEDS);
+  Serial.print(" seedsRemaining=");
+  Serial.print(seedsRemaining);
+  Serial.print(" returning=");
+  Serial.print(task3ReturningToExit ? "yes" : "no");
+  Serial.print(" complete=");
+  Serial.println(task3MissionComplete ? "yes" : "no");
+
+  printGridPoint("Current: ", task3CurrentPoint);
+  printGridPoint("Route goal: ", task3RouteGoal);
+}
+
+bool pointAllowedForTask3Route(GridPoint point, GridPoint start, GridPoint goal, bool avoidPlanted) {
+  if (!isValidGridPoint(point) || point.row >= TASK3_NAV_ROWS) {
+    return false;
+  }
+
+  if (samePoint(point, start) || samePoint(point, goal)) {
+    return true;
+  }
+
+  if (avoidPlanted && isTask3CellPlanted(point)) {
+    return false;
+  }
+
+  return true;
+}
+
+bool computeTask3Segment(GridPoint start, GridPoint goal, GridPoint *segment, uint8_t &segmentLength, bool avoidPlanted) {
+  if (!pointAllowedForTask3Route(start, start, goal, false) ||
+      !pointAllowedForTask3Route(goal, start, goal, false)) {
+    segmentLength = 0;
+    return false;
+  }
+
+  bool visited[MAX_ROUTE_POINTS];
+  int8_t parent[MAX_ROUTE_POINTS];
+  uint8_t queue[MAX_ROUTE_POINTS];
+  uint8_t head = 0;
+  uint8_t tail = 0;
+
+  for (uint8_t i = 0; i < MAX_ROUTE_POINTS; i++) {
+    visited[i] = false;
+    parent[i] = -1;
+  }
+
+  int startIndex = pointIndex(start);
+  int goalIndex = pointIndex(goal);
+  visited[startIndex] = true;
+  queue[tail++] = startIndex;
+
+  const int8_t rowDelta[4] = {-1, 0, 1, 0};
+  const int8_t colDelta[4] = {0, 1, 0, -1};
+
+  while (head < tail) {
+    int current = queue[head++];
+
+    if (current == goalIndex) {
+      break;
+    }
+
+    GridPoint currentPoint = indexToPoint(current);
+
+    for (uint8_t i = 0; i < 4; i++) {
+      GridPoint nextPoint;
+      nextPoint.row = currentPoint.row + rowDelta[i];
+      nextPoint.col = currentPoint.col + colDelta[i];
+
+      if (!pointAllowedForTask3Route(nextPoint, start, goal, avoidPlanted)) {
+        continue;
+      }
+
+      int nextIndex = pointIndex(nextPoint);
+      if (visited[nextIndex]) {
+        continue;
+      }
+
+      visited[nextIndex] = true;
+      parent[nextIndex] = current;
+      queue[tail++] = nextIndex;
+    }
+  }
+
+  if (!visited[goalIndex]) {
+    segmentLength = 0;
+    return false;
+  }
+
+  uint8_t reverseLength = 0;
+  int current = goalIndex;
+
+  while (current >= 0 && reverseLength < MAX_ROUTE_POINTS) {
+    segment[reverseLength++] = indexToPoint(current);
+    if (current == startIndex) {
+      break;
+    }
+    current = parent[current];
+  }
+
+  segmentLength = reverseLength;
+  for (uint8_t i = 0; i < segmentLength / 2; i++) {
+    GridPoint temp = segment[i];
+    segment[i] = segment[segmentLength - 1 - i];
+    segment[segmentLength - 1 - i] = temp;
+  }
+
+  return true;
+}
+
+RouteAction firstActionForRoute(GridPoint *route, uint8_t routeLength) {
+  if (routeLength < 2) {
+    return ROUTE_ACTION_STOP;
+  }
+
+  Heading nextHeading = headingBetween(route[0], route[1]);
+  return actionFromHeading(currentHeading, nextHeading);
+}
+
+int routeActionPenalty(RouteAction action) {
+  if (action == ROUTE_ACTION_STRAIGHT) {
+    return 0;
+  }
+
+  if (action == ROUTE_ACTION_LEFT || action == ROUTE_ACTION_RIGHT) {
+    return 1;
+  }
+
+  return 200;
+}
+
+bool routeReturnsToCurrent(GridPoint *route, uint8_t routeLength) {
+  for (uint8_t i = 1; i < routeLength; i++) {
+    if (samePoint(route[i], task3CurrentPoint)) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+void copyRouteToActive(GridPoint *route, uint8_t routeLength) {
+  activeRouteLength = routeLength;
+  activeRouteIndex = 0;
+
+  for (uint8_t i = 0; i < routeLength && i < MAX_ROUTE_POINTS; i++) {
+    activeRoute[i] = route[i];
+  }
+}
+
+bool buildTask3RouteToPoint(GridPoint goal, GridPoint *route, uint8_t &routeLength, bool avoidPlanted) {
+  routeLength = 0;
+
+  if (!task3CurrentPointValid) {
+    Serial.println("Task3 route failed: current RFID point is unknown.");
+    return false;
+  }
+
+  GridPoint direct[MAX_ROUTE_POINTS];
+  uint8_t directLength = 0;
+  bool hasDirect = computeTask3Segment(task3CurrentPoint, goal, direct, directLength, avoidPlanted);
+
+  if (hasDirect && directLength < 2) {
+    for (uint8_t i = 0; i < directLength; i++) {
+      route[i] = direct[i];
+    }
+    routeLength = directLength;
+    return true;
+  }
+
+  if (hasDirect && firstActionForRoute(direct, directLength) != ROUTE_ACTION_UNSUPPORTED) {
+    for (uint8_t i = 0; i < directLength; i++) {
+      route[i] = direct[i];
+    }
+    routeLength = directLength;
+    return true;
+  }
+
+  Heading options[3] = {
+    currentHeading,
+    leftOfHeading(currentHeading),
+    rightOfHeading(currentHeading)
+  };
+
+  bool foundAlternative = false;
+  int bestScore = 32767;
+  GridPoint bestRoute[MAX_ROUTE_POINTS];
+  uint8_t bestLength = 0;
+
+  for (uint8_t option = 0; option < 3; option++) {
+    Heading firstHeading = options[option];
+    RouteAction firstAction = actionFromHeading(currentHeading, firstHeading);
+
+    if (firstAction == ROUTE_ACTION_UNSUPPORTED) {
+      continue;
+    }
+
+    int8_t rowStep = 0;
+    int8_t colStep = 0;
+    headingDelta(firstHeading, rowStep, colStep);
+
+    GridPoint neighbor;
+    neighbor.row = task3CurrentPoint.row + rowStep;
+    neighbor.col = task3CurrentPoint.col + colStep;
+
+    if (!pointAllowedForTask3Route(neighbor, task3CurrentPoint, goal, avoidPlanted)) {
+      continue;
+    }
+
+    GridPoint tail[MAX_ROUTE_POINTS];
+    uint8_t tailLength = 0;
+    if (!computeTask3Segment(neighbor, goal, tail, tailLength, avoidPlanted)) {
+      continue;
+    }
+
+    if (tailLength + 1 > MAX_ROUTE_POINTS) {
+      continue;
+    }
+
+    GridPoint candidateRoute[MAX_ROUTE_POINTS];
+    uint8_t candidateLength = tailLength + 1;
+    candidateRoute[0] = task3CurrentPoint;
+
+    for (uint8_t i = 0; i < tailLength; i++) {
+      candidateRoute[i + 1] = tail[i];
+    }
+
+    if (routeReturnsToCurrent(candidateRoute, candidateLength)) {
+      continue;
+    }
+
+    int score = ((int)candidateLength - 1) * 10 + routeActionPenalty(firstAction);
+    if (!foundAlternative || score < bestScore) {
+      foundAlternative = true;
+      bestScore = score;
+      bestLength = candidateLength;
+
+      for (uint8_t i = 0; i < candidateLength; i++) {
+        bestRoute[i] = candidateRoute[i];
+      }
+    }
+  }
+
+  if (foundAlternative) {
+    for (uint8_t i = 0; i < bestLength; i++) {
+      route[i] = bestRoute[i];
+    }
+    routeLength = bestLength;
+    return true;
+  }
+
+  if (hasDirect) {
+    Serial.println("Task3 route warning: first move would be a U-turn.");
+    for (uint8_t i = 0; i < directLength; i++) {
+      route[i] = direct[i];
+    }
+    routeLength = directLength;
+    return true;
+  }
+
+  return false;
+}
+
+bool setTask3ActiveRoute(GridPoint goal, bool avoidPlanted) {
+  GridPoint route[MAX_ROUTE_POINTS];
+  uint8_t routeLength = 0;
+
+  if (!buildTask3RouteToPoint(goal, route, routeLength, avoidPlanted)) {
+    if (avoidPlanted && buildTask3RouteToPoint(goal, route, routeLength, false)) {
+      Serial.println("Task3 route fallback: using route through planted cells.");
+    } else {
+      activeRouteLength = 0;
+      activeRouteIndex = 0;
+      return false;
+    }
+  }
+
+  copyRouteToActive(route, routeLength);
+  task3RouteGoal = goal;
+  return true;
+}
+
+bool planTask3RouteToExit() {
+  GridPoint exitPoint;
+
+  if (!findUidInMap(String(TASK3_EXIT_UID), exitPoint)) {
+    Serial.println("Task3 exit UID is not in the RFID map.");
+    return false;
+  }
+
+  task3ReturningToExit = true;
+
+  if (!setTask3ActiveRoute(exitPoint, true)) {
+    Serial.println("Task3 cannot plan a route back to the exit.");
+    return false;
+  }
+
+  Serial.println("Task3 return route planned to exit.");
+  printActiveRoute();
+  return true;
+}
+
+bool planTask3RouteToNearestPlant() {
+  bool foundTarget = false;
+  int bestScore = 32767;
+  GridPoint bestTarget = {-1, -1};
+  GridPoint bestRoute[MAX_ROUTE_POINTS];
+  uint8_t bestLength = 0;
+
+  for (uint8_t row = 0; row < TASK3_NAV_ROWS; row++) {
+    for (uint8_t col = 0; col < MAP_COLS; col++) {
+      GridPoint candidate;
+      candidate.row = row;
+      candidate.col = col;
+
+      if (!isTask3PlantableCell(candidate) || isTask3CellPlanted(candidate)) {
+        continue;
+      }
+
+      GridPoint route[MAX_ROUTE_POINTS];
+      uint8_t routeLength = 0;
+      if (!buildTask3RouteToPoint(candidate, route, routeLength, true)) {
+        continue;
+      }
+
+      RouteAction firstAction = firstActionForRoute(route, routeLength);
+      int score = ((int)routeLength - 1) * 10 + routeActionPenalty(firstAction);
+
+      if (!foundTarget || score < bestScore) {
+        foundTarget = true;
+        bestScore = score;
+        bestTarget = candidate;
+        bestLength = routeLength;
+
+        for (uint8_t i = 0; i < routeLength; i++) {
+          bestRoute[i] = route[i];
+        }
+      }
+    }
+  }
+
+  if (!foundTarget) {
+    Serial.println("Task3 has no reachable unplanted cells. Returning to exit.");
+    return planTask3RouteToExit();
+  }
+
+  task3ReturningToExit = false;
+  task3RouteGoal = bestTarget;
+  copyRouteToActive(bestRoute, bestLength);
+
+  Serial.print("Task3 next planting target: ");
+  Serial.println(uidAtPoint(bestTarget));
+  printActiveRoute();
+  return true;
+}
+
+bool prepareTask3PlantingMission() {
+  resetTask3PlantingMemory();
+
+  if (!task3CurrentPointValid) {
+    Serial.println("Task3 start UID is not in the RFID map.");
+    return false;
+  }
+
+  if (seedsRemaining < TASK3_TARGET_SEEDS) {
+    Serial.println("Warning: fewer than 5 seeds are recorded as loaded.");
+  }
+
+  Serial.print("Task3 start UID: ");
+  Serial.println(TASK3_START_UID);
+  Serial.print("Task3 exit UID: ");
+  Serial.println(TASK3_EXIT_UID);
+  Serial.println("Task3 plants only in RFID map rows 1-4.");
+
+  return planTask3RouteToNearestPlant();
+}
+
+void completeTask3MissionAtExit() {
+  task3MissionComplete = true;
+  routeActive = false;
+  stopDrive();
+  enterState(STATE_IDLE);
+  Serial.println("Task3 complete: returned to exit RFID.");
+}
+
+RouteAction nextTask3RouteAction() {
+  if (activeRouteLength < 2) {
+    return ROUTE_ACTION_STOP;
+  }
+
+  Heading nextHeading = headingBetween(activeRoute[0], activeRoute[1]);
+  RouteAction action = actionFromHeading(currentHeading, nextHeading);
+
+  if (action != ROUTE_ACTION_UNSUPPORTED) {
+    currentHeading = nextHeading;
+    activeRouteIndex = 1;
+  }
+
+  return action;
+}
+
+bool continueTask3NavigationFromCurrent(bool pauseBeforeAction) {
+  if (!task3CurrentPointValid) {
+    Serial.println("Task3 cannot continue: current RFID point is unknown.");
+    stopRobot();
+    return false;
+  }
+
+  if (task3SeedsPlanted >= TASK3_TARGET_SEEDS || task3ReturningToExit) {
+    if (isTask3ExitPoint(task3CurrentPoint)) {
+      completeTask3MissionAtExit();
+      return true;
+    }
+
+    if (!planTask3RouteToExit()) {
+      stopRobot();
+      return false;
+    }
+  } else if (!planTask3RouteToNearestPlant()) {
+    stopRobot();
+    return false;
+  }
+
+  if (activeRouteLength < 2) {
+    if (task3ReturningToExit && isTask3ExitPoint(task3CurrentPoint)) {
+      completeTask3MissionAtExit();
+      return true;
+    }
+
+    enterState(STATE_FOLLOW_LINE);
+    return true;
+  }
+
+  RouteAction action = nextTask3RouteAction();
+
+  if (pauseBeforeAction) {
+    executeRouteAction(action);
+  } else {
+    performRouteAction(action);
+  }
+
+  return true;
+}
+
+void startTask3PlantAtCurrentPoint() {
+  task3PendingPlantPoint = task3CurrentPoint;
+  task3PendingPlantValid = true;
+
+  stopDrive();
+  Serial.print("Task3 planting check accepted at ");
+  Serial.println(uidAtPoint(task3PendingPlantPoint));
+  enterState(STATE_PLANT_RFID_PAUSE);
+}
+
+void completeTask3PlantingDrop() {
+  if (task3PendingPlantValid && isValidGridPoint(task3PendingPlantPoint)) {
+    task3Planted[task3PendingPlantPoint.row][task3PendingPlantPoint.col] = true;
+    task3SeedsPlanted++;
+
+    Serial.print("Task3 planted ");
+    Serial.print(task3SeedsPlanted);
+    Serial.print("/");
+    Serial.print(TASK3_TARGET_SEEDS);
+    Serial.print(" at ");
+    Serial.println(uidAtPoint(task3PendingPlantPoint));
+  }
+
+  task3PendingPlantValid = false;
+  setInvalidPoint(task3PendingPlantPoint);
+
+  if (task3SeedsPlanted >= TASK3_TARGET_SEEDS) {
+    task3ReturningToExit = true;
+    Serial.println("Task3 planted 5 seeds. Returning to exit.");
+  }
+
+  continueTask3NavigationFromCurrent(false);
+}
+
 void printActiveRoute() {
   Serial.print("Route points: ");
   Serial.println(activeRouteLength);
@@ -807,27 +1815,11 @@ void printFixedActions() {
 }
 
 bool prepareSelectedRoute() {
-  bool routeBuilt = false;
+  activeRouteIndex = 0;
+  currentHeading = configuredStartHeading;
 
-  if (selectedNavMode == NAV_MODE_TASK3_FIXED) {
-    activeRouteLength = 0;
-    activeRouteIndex = 0;
-    fixedActionIndex = 0;
-    routeBuilt = true;
-  } else {
-    if (autoStartUid.length() == 0 && latestRfidUid.length() > 0) {
-      autoStartUid = latestRfidUid;
-      Serial.print("Auto start set from latest RFID: ");
-      Serial.println(autoStartUid);
-    }
-
-    if (autoStartUid.length() == 0 || autoGoalUid.length() == 0) {
-      Serial.println("Auto route needs start and goal UIDs. Use: start <uid> and goal <uid>");
-      return false;
-    }
-
-    routeBuilt = buildAutoRoute();
-  }
+  selectedNavMode = NAV_MODE_TASK3_PLANTING;
+  bool routeBuilt = prepareTask3PlantingMission();
 
   if (!routeBuilt) {
     Serial.println("Route build failed.");
@@ -835,19 +1827,14 @@ bool prepareSelectedRoute() {
     return false;
   }
 
-  activeRouteIndex = 0;
-  currentHeading = configuredStartHeading;
   routeActive = true;
 
   Serial.print("Navigation mode: ");
   Serial.println(navigationModeName(selectedNavMode));
   Serial.print("Start heading: ");
   Serial.println(headingName(currentHeading));
-  if (selectedNavMode == NAV_MODE_TASK3_FIXED) {
-    printFixedActions();
-  } else {
-    printActiveRoute();
-  }
+  printTask3PlantingStatus();
+  printActiveRoute();
   return true;
 }
 
@@ -917,58 +1904,60 @@ void handleFixedTask3Rfid(const String &uid) {
   executeRouteAction(ROUTE_ACTION_STOP);
 }
 
+void handleTask3PlantingRfid(const String &uid) {
+  GridPoint point;
+  if (!findUidInMap(uid, point)) {
+    Serial.print("Task3 RFID not found in map: ");
+    Serial.println(uid);
+    return;
+  }
+
+  task3CurrentPoint = point;
+  task3CurrentPointValid = true;
+
+  Serial.print("Task3 RFID r");
+  Serial.print(point.row + 1);
+  Serial.print(" c");
+  Serial.print(point.col + 1);
+  Serial.print(" ");
+  Serial.println(uid);
+
+  if (task3MissionComplete) {
+    Serial.println("Task3 mission already complete. Ignoring RFID.");
+    return;
+  }
+
+  if (task3SeedsPlanted >= TASK3_TARGET_SEEDS) {
+    task3ReturningToExit = true;
+  }
+
+  if (task3ReturningToExit) {
+    continueTask3NavigationFromCurrent(true);
+    return;
+  }
+
+  if (isTask3PlantableCell(point)) {
+    if (!isTask3CellPlanted(point)) {
+      startTask3PlantAtCurrentPoint();
+      return;
+    }
+
+    Serial.println("Task3 cell already planted. Replanning around it.");
+  } else if (point.row >= TASK3_NAV_ROWS) {
+    Serial.println("Task3 RFID is outside rows 1-4, navigation only.");
+  } else {
+    Serial.println("Task3 start/exit RFID, navigation only.");
+  }
+
+  continueTask3NavigationFromCurrent(true);
+}
+
 void handleRouteRfid(const String &uid) {
   if (!routeActive || robotState != STATE_FOLLOW_LINE || lineOnlyMode) {
     return;
   }
 
-  if (selectedNavMode == NAV_MODE_TASK3_FIXED) {
-    handleFixedTask3Rfid(uid);
-    return;
-  }
-
-  GridPoint point;
-  if (!findUidInMap(uid, point)) {
-    Serial.print("RFID not found in map: ");
-    Serial.println(uid);
-    return;
-  }
-
-  int routeMatch = -1;
-  for (uint8_t i = activeRouteIndex; i < activeRouteLength; i++) {
-    if (samePoint(point, activeRoute[i])) {
-      routeMatch = i;
-      break;
-    }
-  }
-
-  if (routeMatch < 0) {
-    Serial.print("RFID is not on active route: ");
-    Serial.println(uid);
-    return;
-  }
-
-  activeRouteIndex = routeMatch;
-
-  Serial.print("RFID route point ");
-  Serial.print(activeRouteIndex);
-  Serial.print("/");
-  Serial.print(activeRouteLength - 1);
-  Serial.print(": ");
-  Serial.println(uid);
-
-  if (activeRouteIndex >= activeRouteLength - 1) {
-    routeActive = false;
-    executeRouteAction(ROUTE_ACTION_STOP);
-    return;
-  }
-
-  Heading nextHeading = headingBetween(activeRoute[activeRouteIndex], activeRoute[activeRouteIndex + 1]);
-  RouteAction action = actionFromHeading(currentHeading, nextHeading);
-  currentHeading = nextHeading;
-  activeRouteIndex++;
-
-  executeRouteAction(action);
+  handleTask3PlantingRfid(uid);
 }
 
 bool isI2cDevicePresent(byte address) {
@@ -1122,6 +2111,36 @@ void updateStateMachine() {
     if (elapsed >= RFID_PAUSE_MS) {
       performRouteAction(pendingPausedAction);
     }
+  } else if (robotState == STATE_PLANT_RFID_PAUSE) {
+    stopDrive();
+
+    if (elapsed >= RFID_PAUSE_MS) {
+      enterState(STATE_PLANT_FORWARD);
+    }
+  } else if (robotState == STATE_PLANT_FORWARD) {
+    setDriveSpeeds(PLANT_FORWARD_SPEED, PLANT_FORWARD_SPEED);
+
+    if (elapsed >= PLANT_FORWARD_2CM_MS) {
+      stopDrive();
+
+      if (seedsRemaining <= 0) {
+        Serial.println("Task3 out of seeds. Load one seed, then send: plant load");
+        enterState(STATE_WAIT_FOR_SEED_LOAD);
+      } else if (startSeedDrop()) {
+        enterState(STATE_PLANT_DROP);
+      } else {
+        Serial.println("Task3 seed drop could not start. Waiting for manual seed load.");
+        enterState(STATE_WAIT_FOR_SEED_LOAD);
+      }
+    }
+  } else if (robotState == STATE_PLANT_DROP) {
+    stopDrive();
+
+    if (!isSeedDropperBusy()) {
+      completeTask3PlantingDrop();
+    }
+  } else if (robotState == STATE_WAIT_FOR_SEED_LOAD) {
+    stopDrive();
   } else if (robotState == STATE_PRE_TURN) {
     setDriveSpeeds(PRE_TURN_SPEED, PRE_TURN_SPEED);
 
@@ -1289,6 +2308,10 @@ void printSnapshot(const LineSnapshot &snapshot) {
   Serial.print(activeRouteIndex);
   Serial.print("/");
   Serial.print(activeRouteLength);
+  Serial.print(" task3=");
+  Serial.print(task3SeedsPlanted);
+  Serial.print("/");
+  Serial.print(TASK3_TARGET_SEEDS);
   Serial.print(" fixed=");
   Serial.print(fixedActionIndex);
   Serial.print("/");
@@ -1303,19 +2326,20 @@ void printCurrentSnapshot() {
 void printHelp() {
   Serial.println();
   Serial.println("--- Trial Run 2 Task 3 RFID navigation ---");
-  Serial.println("1 = select fixed Task 3 sequence: straight, right, left, straight");
-  Serial.println("2 = select user start/goal auto route");
-  Serial.println("start <uid> = set auto-route start RFID");
-  Serial.println("goal <uid> = set auto-route goal RFID");
-  Serial.println("heading north/east/south/west = set starting heading");
-  Serial.println("g = start selected navigation mode");
+  Serial.println("g = start automatic RFID map planting Task 3");
   Serial.println("o = start line-only following, RFID actions disabled");
   Serial.println("s = stop");
   Serial.println("c = reset and recalibrate QTR");
   Serial.println("p = print one sensor snapshot");
   Serial.println("m = toggle live sensor monitor");
-  Serial.println("route = print active route or fixed action sequence");
+  Serial.println("route = print Task 3 planting status and active route");
   Serial.println("rfid = print latest RFID");
+  Serial.println("task3 status/reset = print or reset RFID planting memory");
+  Serial.println("heading north/east/south/west = set starting heading if robot is placed differently");
+  Serial.println("load / plant load = full_v1 clockwise 60 deg load, also resumes Task3 when waiting");
+  Serial.println("drop / plant drop = full_v1 counter-clockwise 60 deg manual drop");
+  Serial.println("plant auto drop = run automatic gate open/close drop test");
+  Serial.println("plant reset/zero/open/close/status = seed dropper controls");
   Serial.println("a/d = debug force left/right turn state");
   Serial.println("h/?/help = help");
   Serial.println("qtr / qtr reset / reset qtr = reset and recalibrate QTR");
@@ -1323,18 +2347,7 @@ void printHelp() {
   Serial.println(navigationModeName(selectedNavMode));
   Serial.print("Start heading: ");
   Serial.println(headingName(configuredStartHeading));
-  Serial.print("Auto start: ");
-  if (autoStartUid.length() > 0) {
-    Serial.println(autoStartUid);
-  } else {
-    Serial.println("(not set)");
-  }
-  Serial.print("Auto goal: ");
-  if (autoGoalUid.length() > 0) {
-    Serial.println(autoGoalUid);
-  } else {
-    Serial.println("(not set)");
-  }
+  printTask3PlantingStatus();
   Serial.println();
 }
 
@@ -1369,15 +2382,18 @@ void processSerialCommand(String command) {
   String lower = command;
   lower.toLowerCase();
 
+  if (handlePlantCommand(lower)) {
+    return;
+  }
+
   if (command.length() == 1) {
     char key = command.charAt(0);
 
     if (key == '1') {
-      selectedNavMode = NAV_MODE_TASK3_FIXED;
-      Serial.println("Selected mode: fixed Task 3 route.");
+      selectedNavMode = NAV_MODE_TASK3_PLANTING;
+      Serial.println("Task3 automatic planting is the only navigation mode.");
     } else if (key == '2') {
-      selectedNavMode = NAV_MODE_AUTO_ROUTE;
-      Serial.println("Selected mode: user start/goal auto route.");
+      Serial.println("User-selected route mode is disabled. Send g to start automatic Task3.");
     } else if (key == 'g' || key == 'G') {
       startRobot();
     } else if (key == 'o' || key == 'O') {
@@ -1412,30 +2428,22 @@ void processSerialCommand(String command) {
     return;
   }
 
-  if (lower.startsWith("start ")) {
-    autoStartUid = normalizeUid(command.substring(6));
-    Serial.print("Auto start UID set to ");
-    Serial.println(autoStartUid);
-  } else if (lower.startsWith("goal ")) {
-    autoGoalUid = normalizeUid(command.substring(5));
-    Serial.print("Auto goal UID set to ");
-    Serial.println(autoGoalUid);
-  } else if (lower.startsWith("heading ")) {
+  if (lower.startsWith("heading ")) {
     if (!setHeadingFromText(command.substring(8))) {
       Serial.println("Unknown heading. Use north/east/south/west.");
     }
+  } else if (lower == "mode planting" || lower == "mode task3") {
+    selectedNavMode = NAV_MODE_TASK3_PLANTING;
+    Serial.println("Task3 automatic planting is the only navigation mode.");
   } else if (lower == "mode fixed") {
-    selectedNavMode = NAV_MODE_TASK3_FIXED;
-    Serial.println("Selected mode: fixed Task 3 route.");
+    Serial.println("Fixed route mode is disabled. Send g to start automatic Task3.");
   } else if (lower == "mode auto") {
-    selectedNavMode = NAV_MODE_AUTO_ROUTE;
-    Serial.println("Selected mode: user start/goal auto route.");
+    Serial.println("User-selected auto route mode is disabled. Send g to start automatic Task3.");
+  } else if (lower.startsWith("start ") || lower.startsWith("goal ")) {
+    Serial.println("User-selected start/goal is disabled. Task3 uses the fixed map start and exit.");
   } else if (lower == "route") {
-    if (selectedNavMode == NAV_MODE_TASK3_FIXED) {
-      printFixedActions();
-    } else {
-      printActiveRoute();
-    }
+    printTask3PlantingStatus();
+    printActiveRoute();
   } else if (lower == "rfid") {
     Serial.print("Latest RFID: ");
     if (latestRfidUid.length() > 0) {
@@ -1445,6 +2453,15 @@ void processSerialCommand(String command) {
     }
   } else if (lower == "help") {
     printHelp();
+  } else if (lower == "task3 status") {
+    printTask3PlantingStatus();
+  } else if (lower == "task3 reset") {
+    if (robotState != STATE_IDLE) {
+      Serial.println("Stop Task 3 before resetting planting memory.");
+    } else {
+      resetTask3PlantingMemory();
+      printTask3PlantingStatus();
+    }
   } else if (lower == "qtr" || lower == "qtr reset" || lower == "reset qtr") {
     resetQTRSensor();
     Serial.println("Ready after QTR reset.");
@@ -1491,6 +2508,8 @@ void setup() {
   pinMode(LED_RED_PIN, OUTPUT);
   pinMode(LED_GREEN_PIN, OUTPUT);
 
+  setupSeedDropper();
+
   pinMode(QTR_EMITTER_PIN, OUTPUT);
   digitalWrite(QTR_EMITTER_PIN, HIGH);
 
@@ -1524,12 +2543,13 @@ void setup() {
   lastLineSeenMs = millis();
   updateStatusLED();
   printHelp();
-  Serial.println("Choose 1 or 2, set heading/start/goal if needed, then send g or press D32.");
+  Serial.println("Send g or press D32 to start automatic Task3 planting.");
 }
 
 void loop() {
   handleSerialCommands();
   handleButtons();
+  updateSeedDropper();
   pollRFID();
   updateStateMachine();
   updateStatusLED();
