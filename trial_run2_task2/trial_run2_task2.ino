@@ -1,6 +1,8 @@
 #include <Wire.h>
 #include <Motoron.h>
 #include <MFRC522_I2C.h>
+#include <MiniMessenger.h>
+#include "secrets.h"
 
 // =====================================================
 // Sensor + motor integration test
@@ -46,16 +48,16 @@ const uint8_t REAR_RIGHT_MOTOR = 2;
 const int LEFT_MOTOR_SIGN = 1;
 const int RIGHT_MOTOR_SIGN = -1;
 
-const int BASE_SPEED = 250;
-const int CURVE_BASE_SPEED = 250;
-const int MAX_SPEED = 650;
-const int MAX_TURN = 650;
-const int SEARCH_SPEED = 220;
+const int BASE_SPEED = 200;
+const int CURVE_BASE_SPEED = 200;
+const int MAX_SPEED = 600;
+const int MAX_TURN = 600;
+const int SEARCH_SPEED = 170;
 
-const int TURN_SPEED = 600;
-const int TURN_BOOST_SPEED = 650;
-const int PRE_TURN_SPEED = 600;
-const int BRIDGE_SPEED = 600;
+const int TURN_SPEED = 450;
+const int TURN_BOOST_SPEED = 550;
+const int PRE_TURN_SPEED = 550;
+const int BRIDGE_SPEED = 550;
 
 const float KP = 0.12;
 const float KD = 0.80;
@@ -64,9 +66,25 @@ int lastError = 0;
 
 // -------------------- Buttons and LEDs --------------------
 const int START_BUTTON_PIN = 32;
-const int STOP_BUTTON_PIN = 33;
+const int STOP_BUTTON_PIN = 53;
 const int LED_RED_PIN = 34;
 const int LED_GREEN_PIN = 35;
+
+// -------------------- MiniMessenger airlock request --------------------
+MiniMessenger messenger;
+
+const char *BOARD_ID = "Robot1";
+const char *SERVER_BOARD_ID = "server";
+const char *TASK2_AIRLOCK_ID = "A";
+
+const unsigned long REGISTER_SEND_MS = 10000;
+const unsigned long AIRLOCK_REQUEST_RETRY_MS = 1200;
+const byte TEAM_STATUS_BYTES = 6;
+
+unsigned long lastRegisterSendMs = 0;
+unsigned long lastAirlockSendAttemptMs = 0;
+String pendingAirlockUid = "";
+String lastAirlockRequestedUid = "";
 
 // -------------------- RFID pause marker --------------------
 const byte RFID_I2C_ADDRESS = 0x28;
@@ -80,7 +98,7 @@ MFRC522_I2C rfid(RFID_I2C_ADDRESS, RFID_RESET_PIN, &Wire1);
 // -------------------- Junction detection tuning --------------------
 const uint8_t SPECIAL_DETECT_FRAMES = 3;
 const uint8_t RIGHT_ANGLE_DETECT_FRAMES = 3;
-const unsigned long PRE_TURN_MS = 110;
+const unsigned long PRE_TURN_MS = 115;
 const unsigned long PIVOT_KICK_MS = 0;
 const unsigned long TURN_BOOST_MS = 500;
 const unsigned long TURN_MIN_MS = 300;
@@ -155,10 +173,15 @@ uint8_t tJunctionFrames = 0;
 uint8_t hollowCrossFrames = 0;
 
 void stopDrive();
+void stopRobot();
 void printHelp();
 void printSnapshot(const LineSnapshot &snapshot);
 void enterState(RobotState newState);
 void pollRFID();
+void sendRegisterIfNeeded();
+void sendPendingAirlockRequestIfNeeded();
+void queueAirlockRequest(const String &uid);
+void onMessage(const MessageMetadata &metadata, const uint8_t *payload, size_t length);
 
 // =====================================================
 // QTR reading and calibration
@@ -397,6 +420,248 @@ void stopDrive() {
 }
 
 // =====================================================
+// MiniMessenger helpers
+// =====================================================
+
+String payloadToString(const uint8_t *payload, size_t length) {
+  String text = "";
+
+  for (size_t i = 0; i < length; i++) {
+    text += (char)payload[i];
+  }
+
+  text.trim();
+  return text;
+}
+
+bool payloadLooksLikeTextMessage(const uint8_t *payload, size_t length) {
+  return length >= 5 &&
+         payload[0] == 't' &&
+         payload[1] == 'y' &&
+         payload[2] == 'p' &&
+         payload[3] == 'e' &&
+         payload[4] == '=';
+}
+
+String getMessageField(const String &messageText, const char *key) {
+  String prefix = String(key) + "=";
+  int start = messageText.indexOf(prefix);
+
+  if (start < 0) {
+    return "";
+  }
+
+  start += prefix.length();
+  int end = messageText.indexOf(' ', start);
+
+  if (end < 0) {
+    end = messageText.length();
+  }
+
+  return messageText.substring(start, end);
+}
+
+bool messageTypeIs(const String &messageText, const char *expectedType) {
+  return getMessageField(messageText, "type") == expectedType;
+}
+
+bool textIsTrue(String text) {
+  text.trim();
+  text.toLowerCase();
+  return text == "true" || text == "1" || text == "yes";
+}
+
+bool sendServerText(const char *messageText) {
+  if (!messenger.isConnected()) {
+    Serial.print("MiniMessenger disconnected, cannot send: ");
+    Serial.println(messageText);
+    return false;
+  }
+
+  if (messenger.sendToBoard(SERVER_BOARD_ID, messageText)) {
+    Serial.print("Sent to server: ");
+    Serial.println(messageText);
+    return true;
+  }
+
+  Serial.print("Server send failed: ");
+  Serial.println(messageText);
+  return false;
+}
+
+void sendRegisterIfNeeded() {
+  if (!messenger.isConnected()) {
+    return;
+  }
+
+  if (lastRegisterSendMs != 0 && millis() - lastRegisterSendMs < REGISTER_SEND_MS) {
+    return;
+  }
+
+  lastRegisterSendMs = millis();
+
+  char message[96];
+  snprintf(message,
+           sizeof(message),
+           "type=register team_id=%s board_id=%s",
+           GROUP_ID,
+           BOARD_ID);
+
+  sendServerText(message);
+}
+
+bool sendOpenAirlockRequest(const String &uid) {
+  if (uid.length() == 0) {
+    Serial.println("Airlock request skipped: no RFID UID.");
+    return false;
+  }
+
+  char message[160];
+  snprintf(message,
+           sizeof(message),
+           "type=openAirlock team_id=%s airlock=%s tag_id=%s board_id=%s",
+           GROUP_ID,
+           TASK2_AIRLOCK_ID,
+           uid.c_str(),
+           BOARD_ID);
+
+  return sendServerText(message);
+}
+
+void queueAirlockRequest(const String &uid) {
+  if (uid.length() == 0) {
+    return;
+  }
+
+  pendingAirlockUid = uid;
+  lastAirlockSendAttemptMs = 0;
+
+  Serial.print("Queued airlock request for RFID: ");
+  Serial.println(uid);
+  sendPendingAirlockRequestIfNeeded();
+}
+
+void sendPendingAirlockRequestIfNeeded() {
+  if (pendingAirlockUid.length() == 0) {
+    return;
+  }
+
+  if (lastAirlockSendAttemptMs != 0 &&
+      millis() - lastAirlockSendAttemptMs < AIRLOCK_REQUEST_RETRY_MS) {
+    return;
+  }
+
+  lastAirlockSendAttemptMs = millis();
+
+  if (sendOpenAirlockRequest(pendingAirlockUid)) {
+    lastAirlockRequestedUid = pendingAirlockUid;
+    pendingAirlockUid = "";
+  }
+}
+
+void handleOpenAirlockAck(const String &messageText) {
+  String success = getMessageField(messageText, "success");
+  String accepted = getMessageField(messageText, "accepted");
+  String airlock = getMessageField(messageText, "airlock");
+  String reason = getMessageField(messageText, "reason");
+
+  Serial.print("Airlock ack | airlock=");
+  Serial.print(airlock.length() ? airlock : TASK2_AIRLOCK_ID);
+  Serial.print(" success=");
+  if (success.length() > 0) {
+    Serial.print(success);
+  } else if (accepted.length() > 0) {
+    Serial.print(accepted);
+  } else {
+    Serial.print("unknown");
+  }
+
+  if (reason.length() > 0) {
+    Serial.print(" reason=");
+    Serial.print(reason);
+  }
+
+  Serial.println();
+}
+
+void handleTeamStatusPayload(const uint8_t *payload) {
+  Serial.print("Team status | queueExit=");
+  Serial.print(payload[0]);
+  Serial.print(" airlockB=");
+  Serial.print(payload[1]);
+  Serial.print(" queueEnter=");
+  Serial.print(payload[2]);
+  Serial.print(" airlockA=");
+  Serial.print(payload[3]);
+  Serial.print(" emergency=");
+  Serial.print(payload[4]);
+  Serial.print(" reEntry=");
+  Serial.println(payload[5]);
+
+  if (payload[4] == 1) {
+    stopRobot();
+    Serial.println("Task 2 stopped by team emergency status.");
+  }
+}
+
+void handleServerMessage(const String &messageText) {
+  if (messageTypeIs(messageText, "openAirlockAck") ||
+      messageTypeIs(messageText, "openAirlockReply")) {
+    handleOpenAirlockAck(messageText);
+    return;
+  }
+
+  if (messageTypeIs(messageText, "heartbeat")) {
+    String enable = getMessageField(messageText, "enable");
+    if (enable.length() > 0 && !textIsTrue(enable)) {
+      stopRobot();
+      Serial.println("Task 2 stopped by server heartbeat.");
+    }
+    return;
+  }
+
+  if (messageTypeIs(messageText, "emergency") || messageTypeIs(messageText, "disable")) {
+    stopRobot();
+    Serial.println("Task 2 stopped by server message.");
+    return;
+  }
+
+  if (messageTypeIs(messageText, "enable")) {
+    Serial.println("Server enable received. Task 2 still starts from D32 or serial g.");
+  }
+}
+
+void onMessage(const MessageMetadata &metadata, const uint8_t *payload, size_t length) {
+  if (length == TEAM_STATUS_BYTES && !payloadLooksLikeTextMessage(payload, length)) {
+    Serial.print("Binary message from Board ");
+    Serial.print(metadata.fromBoardId);
+    Serial.print(" length=");
+    Serial.println(length);
+    handleTeamStatusPayload(payload);
+    return;
+  }
+
+  if (!payloadLooksLikeTextMessage(payload, length)) {
+    Serial.print("Binary message ignored from Board ");
+    Serial.print(metadata.fromBoardId);
+    Serial.print(" length=");
+    Serial.println(length);
+    return;
+  }
+
+  String messageText = payloadToString(payload, length);
+
+  Serial.print("Message from Board ");
+  Serial.print(metadata.fromBoardId);
+  Serial.print(": ");
+  Serial.println(messageText);
+
+  if (messageText.length() > 0) {
+    handleServerMessage(messageText);
+  }
+}
+
+// =====================================================
 // Detection and state machine
 // =====================================================
 
@@ -535,6 +800,7 @@ void pollRFID() {
   if (task2Mode && robotState == STATE_FOLLOW_LINE && !lineOnlyMode && !sameUidTooSoon) {
     lastPausedRfidUid = uid;
     lastRfidPauseMs = nowMs;
+    queueAirlockRequest(uid);
     startRfidPause(uid);
   }
 
@@ -943,6 +1209,7 @@ void printHelp() {
   Serial.println("m = toggle live sensor monitor");
   Serial.println("l/r/x = debug only: decision for any extra T junction");
   Serial.println("RFID read during Task 2 pauses briefly, then resumes line following");
+  Serial.println("RFID read during Task 2 also sends openAirlock to the server");
   Serial.println("Right-angle bends auto-turn: left bend -> left, right bend -> right");
   Serial.println("a = force left right-angle turn state");
   Serial.println("d = force right right-angle turn state");
@@ -1050,6 +1317,9 @@ void setup() {
 
   rfid.PCD_Init();
 
+  messenger.onMessage(onMessage);
+  messenger.begin(WIFI_SSID, WIFI_PASSWORD, BROKER_HOST, BROKER_PORT, GROUP_ID, BOARD_ID);
+
   stopDrive();
   enterState(STATE_IDLE);
   runQTRCalibration();
@@ -1061,6 +1331,9 @@ void setup() {
 }
 
 void loop() {
+  messenger.loop();
+  sendRegisterIfNeeded();
+  sendPendingAirlockRequestIfNeeded();
   handleSerialCommands();
   handleButtons();
   pollRFID();
