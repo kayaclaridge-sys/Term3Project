@@ -46,9 +46,9 @@ const uint8_t REAR_RIGHT_MOTOR = 2;
 const int LEFT_MOTOR_SIGN = 1;
 const int RIGHT_MOTOR_SIGN = -1;
 
-const int BASE_SPEED = 280;
-const int CURVE_BASE_SPEED = 220;
-const int SHARP_CURVE_BASE_SPEED = 180;
+const int BASE_SPEED = 480;
+const int CURVE_BASE_SPEED = 320;
+const int SHARP_CURVE_BASE_SPEED = 280;
 const int MAX_SPEED = 650;
 const int MAX_TURN = 650;
 const int SEARCH_SPEED = 220;
