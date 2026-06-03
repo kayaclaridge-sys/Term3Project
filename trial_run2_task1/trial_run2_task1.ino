@@ -70,7 +70,7 @@ int lastError = 0;
 
 // -------------------- Buttons and LEDs --------------------
 const int START_BUTTON_PIN = 32;
-const int STOP_BUTTON_PIN = 33;
+const int STOP_BUTTON_PIN = 53;
 const int LED_RED_PIN = 34;
 const int LED_GREEN_PIN = 35;
 
@@ -680,7 +680,7 @@ void printHelp() {
   Serial.println("m = toggle live sensor monitor");
   Serial.println("Curve assist: stronger differential steering on closed bends");
   Serial.println("h/? = help");
-  Serial.println("D32 starts, D33 stops.");
+  Serial.println("D32 starts, D53 kills/stops.");
   Serial.println();
 }
 
